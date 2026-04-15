@@ -5,7 +5,8 @@ const STORAGE_KEYS = [
   "activeTabId",
   "settings",
   "activityLog",
-  "lastStatus"
+  "lastStatus",
+  "pageStatus"
 ];
 
 const DEFAULT_SETTINGS = {
@@ -20,6 +21,17 @@ const DEFAULT_SETTINGS = {
   maxRetries: 1
 };
 
+const DEFAULT_PAGE_STATUS = {
+  connected: false,
+  ready: false,
+  composerFound: false,
+  sendButtonFound: false,
+  generating: false,
+  draftPresent: false,
+  lastCheckedAt: null,
+  reason: "Waiting for a ChatGPT tab."
+};
+
 const DEFAULT_STATE = {
   queue: [],
   runState: "idle",
@@ -27,18 +39,64 @@ const DEFAULT_STATE = {
   activeTabId: null,
   settings: DEFAULT_SETTINGS,
   activityLog: [],
-  lastStatus: "Idle"
+  lastStatus: "Idle",
+  pageStatus: DEFAULT_PAGE_STATUS
 };
 
 const QUEUE_TICK_ALARM = "queueTick";
 
 chrome.runtime.onInstalled.addListener(async () => {
   await ensureState();
-  await appendLog("Extension installed. Open chatgpt.com to start.");
+  await appendLog("Extension installed. Open ChatGPT in Chrome to start.");
 });
 
 chrome.runtime.onStartup.addListener(async () => {
   await ensureState();
+});
+
+chrome.action.onClicked.addListener(async (tab) => {
+  await ensureState();
+
+  if (tab?.id && isChatGPTUrl(tab.url)) {
+    await safeSendToTab(tab.id, {
+      type: "OVERLAY/TOGGLE"
+    });
+
+    await patchState({
+      activeTabId: tab.id
+    });
+
+    return;
+  }
+
+  const existingTab = await findChatGPTTab();
+  if (existingTab?.id) {
+    await chrome.tabs.update(existingTab.id, { active: true });
+
+    if (existingTab.windowId) {
+      await chrome.windows.update(existingTab.windowId, { focused: true });
+    }
+
+    await safeSendToTab(existingTab.id, {
+      type: "OVERLAY/SHOW"
+    });
+
+    await patchState({
+      activeTabId: existingTab.id
+    });
+
+    return;
+  }
+
+  const createdTab = await chrome.tabs.create({
+    url: "https://chatgpt.com/"
+  });
+
+  if (createdTab?.id) {
+    await patchState({
+      activeTabId: createdTab.id
+    });
+  }
 });
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
@@ -57,6 +115,7 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 
   await patchState({
     activeTabId: null,
+    pageStatus: buildDisconnectedPageStatus("Tracked ChatGPT tab closed."),
     lastStatus: "Tracked ChatGPT tab closed."
   });
 
@@ -70,9 +129,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 
   const state = await getState();
   if (state.activeTabId === tabId) {
-    await patchState({
-      lastStatus: "ChatGPT tab refreshed. Reconnecting."
-    });
+    await refreshPageStatusForTab(tabId, "ChatGPT tab refreshed.");
 
     if (state.runState === "running") {
       await scheduleQueueTick(1000);
@@ -109,12 +166,24 @@ async function handleMessage(message, sender) {
       return handleStop();
     case "POPUP/SKIP_CURRENT":
       return handleSkipCurrent();
+    case "POPUP/RETRY_CURRENT":
+      return handleRetryCurrent();
+    case "POPUP/REMOVE_ITEM":
+      return handleRemoveItem(message.payload?.itemId);
+    case "POPUP/MOVE_ITEM":
+      return handleMoveItem(message.payload?.itemId, message.payload?.direction);
+    case "POPUP/RETRY_ITEM":
+      return handleRetryItem(message.payload?.itemId);
     case "POPUP/CLEAR_COMPLETED":
       return handleClearCompleted();
     case "POPUP/CLEAR_ALL":
       return handleClearAll();
+    case "POPUP/SAVE_SETTINGS":
+      return handleSaveSettings(message.payload?.settings ?? {});
+    case "POPUP/REFRESH_PAGE_STATUS":
+      return handleRefreshPageStatus();
     case "CONTENT/READY":
-      return handleContentReady(sender);
+      return handleContentReady(message.payload, sender);
     case "CONTENT/SUBMITTED":
       return handlePromptSubmitted(message.payload, sender);
     case "CONTENT/DONE":
@@ -168,7 +237,9 @@ async function handleAddPrompts(rawPrompts) {
 
 async function handleStart() {
   const state = await getState();
-  if (!state.queue.some((item) => item.status === "queued")) {
+  const canRun = state.currentItemId || state.queue.some((item) => item.status === "queued");
+
+  if (!canRun) {
     await patchState({
       lastStatus: "Queue is empty."
     });
@@ -185,7 +256,7 @@ async function handleStart() {
   });
 
   await appendLog("Queue started.");
-  await scheduleQueueTick(state.settings.startupDelayMs);
+  await scheduleQueueTick(state.currentItemId ? 250 : state.settings.startupDelayMs);
 
   return {
     ok: true
@@ -225,7 +296,13 @@ async function handleStop() {
 
   await patchState({
     runState: "stopped",
-    lastStatus: "Queue stopped."
+    lastStatus: "Queue stopped.",
+    pageStatus: {
+      ...state.pageStatus,
+      generating: false,
+      lastCheckedAt: new Date().toISOString(),
+      reason: "Queue stopped."
+    }
   });
 
   await chrome.alarms.clear(QUEUE_TICK_ALARM);
@@ -294,7 +371,13 @@ async function handleSkipCurrent() {
   await chrome.storage.local.set({
     queue,
     currentItemId: null,
-    lastStatus: "Current prompt skipped."
+    lastStatus: "Current prompt skipped.",
+    pageStatus: {
+      ...state.pageStatus,
+      generating: false,
+      lastCheckedAt: new Date().toISOString(),
+      reason: "Current prompt skipped."
+    }
   });
 
   await appendLog("Current prompt skipped.", "warn");
@@ -302,6 +385,215 @@ async function handleSkipCurrent() {
   const latestState = await getState();
   if (latestState.runState === "running") {
     await scheduleQueueTick(latestState.settings.cooldownMs);
+  }
+
+  return {
+    ok: true
+  };
+}
+
+async function handleRetryCurrent() {
+  const state = await getState();
+  if (!state.currentItemId) {
+    return {
+      ok: false,
+      error: "There is no active prompt to retry."
+    };
+  }
+
+  if (state.activeTabId) {
+    await safeSendToTab(state.activeTabId, {
+      type: "CONTENT/ABORT"
+    });
+  }
+
+  const queue = state.queue.map((item) => {
+    if (item.id !== state.currentItemId) {
+      return item;
+    }
+
+    return {
+      ...item,
+      status: "queued",
+      startedAt: null,
+      finishedAt: null,
+      retryCount: item.retryCount + 1,
+      lastError: "Retry requested by user."
+    };
+  });
+
+  await chrome.storage.local.set({
+    queue,
+    currentItemId: null,
+    lastStatus: "Current prompt requeued.",
+    pageStatus: {
+      ...state.pageStatus,
+      generating: false,
+      lastCheckedAt: new Date().toISOString(),
+      reason: "Current prompt requeued."
+    }
+  });
+
+  await appendLog("Current prompt requeued.", "warn");
+
+  const latestState = await getState();
+  if (latestState.runState === "running") {
+    await scheduleQueueTick(400);
+  }
+
+  return {
+    ok: true
+  };
+}
+
+async function handleRemoveItem(itemId) {
+  const state = await getState();
+
+  if (!itemId) {
+    return {
+      ok: false,
+      error: "Missing itemId."
+    };
+  }
+
+  if (state.currentItemId === itemId) {
+    return {
+      ok: false,
+      error: "Use Skip Current or Retry Current for the active prompt."
+    };
+  }
+
+  const item = state.queue.find((entry) => entry.id === itemId);
+  if (!item) {
+    return {
+      ok: false,
+      error: "Prompt not found."
+    };
+  }
+
+  const queue = state.queue.filter((entry) => entry.id !== itemId);
+  const nextState = {
+    queue,
+    lastStatus: "Prompt removed from queue."
+  };
+
+  if (!queue.length && !state.currentItemId && state.runState === "running") {
+    nextState.runState = "idle";
+  }
+
+  await chrome.storage.local.set(nextState);
+  await appendLog("Prompt removed from queue.");
+
+  return {
+    ok: true
+  };
+}
+
+async function handleMoveItem(itemId, direction) {
+  const state = await getState();
+
+  if (!itemId) {
+    return {
+      ok: false,
+      error: "Missing itemId."
+    };
+  }
+
+  if (state.currentItemId === itemId) {
+    return {
+      ok: false,
+      error: "The active prompt cannot be moved."
+    };
+  }
+
+  const index = state.queue.findIndex((item) => item.id === itemId);
+  if (index === -1) {
+    return {
+      ok: false,
+      error: "Prompt not found."
+    };
+  }
+
+  const targetIndex = direction === "up" ? index - 1 : direction === "down" ? index + 1 : -1;
+  if (targetIndex < 0 || targetIndex >= state.queue.length) {
+    return {
+      ok: false,
+      error: "Prompt cannot be moved in that direction."
+    };
+  }
+
+  const queue = [...state.queue];
+  const [item] = queue.splice(index, 1);
+  queue.splice(targetIndex, 0, item);
+
+  await chrome.storage.local.set({
+    queue,
+    lastStatus: `Prompt moved ${direction}.`
+  });
+
+  await appendLog(`Prompt moved ${direction}.`);
+
+  return {
+    ok: true
+  };
+}
+
+async function handleRetryItem(itemId) {
+  const state = await getState();
+
+  if (!itemId) {
+    return {
+      ok: false,
+      error: "Missing itemId."
+    };
+  }
+
+  if (state.currentItemId === itemId) {
+    return {
+      ok: false,
+      error: "Use Retry Current for the active prompt."
+    };
+  }
+
+  const item = state.queue.find((entry) => entry.id === itemId);
+  if (!item) {
+    return {
+      ok: false,
+      error: "Prompt not found."
+    };
+  }
+
+  if (item.status === "sending" || item.status === "waiting") {
+    return {
+      ok: false,
+      error: "The prompt is already in progress."
+    };
+  }
+
+  const queue = state.queue.map((entry) => {
+    if (entry.id !== itemId) {
+      return entry;
+    }
+
+    return {
+      ...entry,
+      status: "queued",
+      startedAt: null,
+      finishedAt: null,
+      lastError: null
+    };
+  });
+
+  await chrome.storage.local.set({
+    queue,
+    lastStatus: "Prompt requeued."
+  });
+
+  await appendLog("Prompt requeued.");
+
+  const latestState = await getState();
+  if (latestState.runState === "running") {
+    await scheduleQueueTick(400);
   }
 
   return {
@@ -341,20 +633,78 @@ async function handleClearAll() {
   };
 }
 
-async function handleContentReady(sender) {
+async function handleSaveSettings(rawSettings) {
+  const state = await getState();
+  const settings = sanitizeSettings({
+    ...state.settings,
+    ...rawSettings
+  });
+
+  await patchState({
+    settings,
+    lastStatus: "Settings saved."
+  });
+
+  await appendLog("Settings saved.");
+
+  return {
+    ok: true,
+    settings
+  };
+}
+
+async function handleRefreshPageStatus() {
+  const state = await getState();
+  const tab = await findChatGPTTab(state.activeTabId);
+
+  if (!tab?.id) {
+    const pageStatus = buildDisconnectedPageStatus("Open a ChatGPT tab to continue.");
+    await patchState({
+      activeTabId: null,
+      pageStatus,
+      lastStatus: pageStatus.reason
+    });
+
+    return {
+      ok: true,
+      pageStatus
+    };
+  }
+
+  await patchState({
+    activeTabId: tab.id
+  });
+
+  const pageStatus = await refreshPageStatusForTab(tab.id, "Manual page check.");
+
+  return {
+    ok: true,
+    pageStatus
+  };
+}
+
+async function handleContentReady(payload, sender) {
   const tabId = sender.tab?.id ?? null;
   const url = sender.tab?.url ?? "";
 
   if (!tabId || !isChatGPTUrl(url)) {
     return {
       ok: false,
-      error: "Content script is not attached to a chatgpt.com tab."
+      error: "Content script is not attached to a supported ChatGPT tab."
     };
   }
 
+  const pageStatus = normalizePageStatus({
+    ...payload?.status,
+    connected: true,
+    lastCheckedAt: new Date().toISOString(),
+    reason: contentReadyReason(payload?.reason, payload?.status?.ready)
+  });
+
   await patchState({
     activeTabId: tabId,
-    lastStatus: "ChatGPT tab connected."
+    pageStatus,
+    lastStatus: pageStatus.ready ? "ChatGPT tab connected." : pageStatus.reason
   });
 
   const state = await getState();
@@ -403,7 +753,14 @@ async function handlePromptSubmitted(payload, sender) {
   await chrome.storage.local.set({
     queue,
     activeTabId: senderTabId ?? state.activeTabId,
-    lastStatus: "Prompt submitted. Waiting for completion."
+    lastStatus: "Prompt submitted. Waiting for completion.",
+    pageStatus: normalizePageStatus({
+      ...state.pageStatus,
+      connected: true,
+      generating: true,
+      lastCheckedAt: new Date().toISOString(),
+      reason: "Prompt submitted. Waiting for completion."
+    })
   });
 
   await appendLog("Prompt submitted. Waiting for completion.");
@@ -415,6 +772,7 @@ async function handlePromptSubmitted(payload, sender) {
 
 async function handlePromptDone(payload, sender) {
   const itemId = payload?.itemId;
+  const senderTabId = sender.tab?.id ?? null;
   const state = await getState();
 
   if (!itemId) {
@@ -440,11 +798,22 @@ async function handlePromptDone(payload, sender) {
   await chrome.storage.local.set({
     queue,
     currentItemId: null,
-    activeTabId: sender.tab?.id ?? state.activeTabId,
-    lastStatus: "Prompt completed."
+    activeTabId: senderTabId ?? state.activeTabId,
+    lastStatus: "Prompt completed.",
+    pageStatus: normalizePageStatus({
+      ...state.pageStatus,
+      connected: true,
+      generating: false,
+      lastCheckedAt: new Date().toISOString(),
+      reason: "Prompt completed."
+    })
   });
 
   await appendLog("Prompt completed.");
+
+  if (senderTabId) {
+    await refreshPageStatusForTab(senderTabId, "Prompt completed.");
+  }
 
   const latestState = await getState();
   if (latestState.runState === "running") {
@@ -500,7 +869,13 @@ async function processQueue(source) {
   if (!nextItem) {
     await patchState({
       runState: "idle",
-      lastStatus: "Queue complete."
+      lastStatus: "Queue complete.",
+      pageStatus: {
+        ...state.pageStatus,
+        generating: false,
+        lastCheckedAt: new Date().toISOString(),
+        reason: "Queue complete."
+      }
     });
 
     await appendLog("Queue complete.");
@@ -509,12 +884,15 @@ async function processQueue(source) {
 
   const tab = await findChatGPTTab(state.activeTabId);
   if (!tab?.id) {
+    const pageStatus = buildDisconnectedPageStatus("Open a ChatGPT tab to continue.");
+
     await patchState({
       activeTabId: null,
-      lastStatus: "Open a chatgpt.com tab to continue."
+      pageStatus,
+      lastStatus: pageStatus.reason
     });
 
-    await appendLog("No chatgpt.com tab available.", "warn");
+    await appendLog("No supported ChatGPT tab available.", "warn");
     return;
   }
 
@@ -523,9 +901,17 @@ async function processQueue(source) {
   });
 
   if (!ping?.ok) {
+    const pageStatus = normalizePageStatus({
+      connected: true,
+      ready: false,
+      lastCheckedAt: new Date().toISOString(),
+      reason: "ChatGPT page is not ready yet."
+    });
+
     await patchState({
       activeTabId: tab.id,
-      lastStatus: "ChatGPT page is not ready yet."
+      pageStatus,
+      lastStatus: pageStatus.reason
     });
 
     await appendLog("ChatGPT page is not ready yet.", "warn");
@@ -533,12 +919,28 @@ async function processQueue(source) {
     return;
   }
 
-  if (!ping.ready) {
-    await patchState({
-      activeTabId: tab.id,
-      lastStatus: "Waiting for composer and send controls."
-    });
+  const pageStatus = normalizePageStatus({
+    ...ping,
+    connected: true,
+    lastCheckedAt: new Date().toISOString(),
+    reason: ping.ready
+      ? "Page ready."
+      : !ping.composerFound
+        ? "Waiting for composer."
+        : ping.generating
+          ? "Waiting for the current response to finish."
+          : ping.draftPresent
+            ? "Composer has an existing draft."
+            : "Page not ready yet."
+  });
 
+  await patchState({
+    activeTabId: tab.id,
+    pageStatus,
+    lastStatus: pageStatus.reason
+  });
+
+  if (!ping.ready) {
     await scheduleQueueTick(2000);
     return;
   }
@@ -560,7 +962,12 @@ async function processQueue(source) {
     queue,
     currentItemId: nextItem.id,
     activeTabId: tab.id,
-    lastStatus: `Submitting prompt ${getQueuePosition(state.queue, nextItem.id)}.`
+    lastStatus: `Submitting prompt ${getQueuePosition(state.queue, nextItem.id)}.`,
+    pageStatus: normalizePageStatus({
+      ...pageStatus,
+      generating: true,
+      reason: `Submitting prompt ${getQueuePosition(state.queue, nextItem.id)}.`
+    })
   });
 
   await appendLog(`Submitting prompt ${getQueuePosition(state.queue, nextItem.id)} (${source}).`);
@@ -621,7 +1028,14 @@ async function failOrRetryItem(itemId, reason, tabId = null) {
     queue,
     currentItemId: null,
     activeTabId: tabId ?? state.activeTabId,
-    lastStatus: canRetry ? `Retrying prompt after failure: ${reason}` : `Prompt failed: ${reason}`
+    lastStatus: canRetry ? `Retrying prompt after failure: ${reason}` : `Prompt failed: ${reason}`,
+    pageStatus: normalizePageStatus({
+      ...state.pageStatus,
+      connected: Boolean(tabId ?? state.activeTabId),
+      generating: false,
+      lastCheckedAt: new Date().toISOString(),
+      reason: canRetry ? `Retrying prompt after failure: ${reason}` : `Prompt failed: ${reason}`
+    })
   });
 
   await appendLog(
@@ -629,10 +1043,41 @@ async function failOrRetryItem(itemId, reason, tabId = null) {
     canRetry ? "warn" : "error"
   );
 
+  if (tabId ?? state.activeTabId) {
+    await refreshPageStatusForTab(tabId ?? state.activeTabId, canRetry ? "Retry pending." : "Prompt failed.");
+  }
+
   const latestState = await getState();
   if (latestState.runState === "running") {
     await scheduleQueueTick(canRetry ? latestState.settings.retryDelayMs : latestState.settings.cooldownMs);
   }
+}
+
+async function refreshPageStatusForTab(tabId, reason) {
+  const response = await safeSendToTab(tabId, {
+    type: "PAGE/PING"
+  });
+
+  const pageStatus = response?.ok
+    ? normalizePageStatus({
+        ...response,
+        connected: true,
+        lastCheckedAt: new Date().toISOString(),
+        reason
+      })
+    : normalizePageStatus({
+        connected: true,
+        ready: false,
+        lastCheckedAt: new Date().toISOString(),
+        reason
+      });
+
+  await chrome.storage.local.set({
+    activeTabId: tabId,
+    pageStatus
+  });
+
+  return pageStatus;
 }
 
 async function findChatGPTTab(preferredTabId) {
@@ -648,7 +1093,7 @@ async function findChatGPTTab(preferredTabId) {
   }
 
   const tabs = await chrome.tabs.query({
-    url: ["https://chatgpt.com/*"]
+    url: ["https://chatgpt.com/*", "https://chat.openai.com/*"]
   });
 
   if (!tabs.length) {
@@ -694,7 +1139,11 @@ async function patchState(partialState) {
     settings: {
       ...state.settings,
       ...(partialState.settings || {})
-    }
+    },
+    pageStatus: normalizePageStatus({
+      ...state.pageStatus,
+      ...(partialState.pageStatus || {})
+    })
   };
 
   await chrome.storage.local.set(nextState);
@@ -710,8 +1159,29 @@ function normalizeState(rawState) {
       ...(rawState.settings || {})
     },
     queue: Array.isArray(rawState.queue) ? rawState.queue : [],
-    activityLog: Array.isArray(rawState.activityLog) ? rawState.activityLog : []
+    activityLog: Array.isArray(rawState.activityLog) ? rawState.activityLog : [],
+    pageStatus: normalizePageStatus(rawState.pageStatus || {})
   };
+}
+
+function normalizePageStatus(rawPageStatus) {
+  return {
+    ...DEFAULT_PAGE_STATUS,
+    ...(rawPageStatus || {})
+  };
+}
+
+function buildDisconnectedPageStatus(reason) {
+  return normalizePageStatus({
+    connected: false,
+    ready: false,
+    composerFound: false,
+    sendButtonFound: false,
+    generating: false,
+    draftPresent: false,
+    lastCheckedAt: new Date().toISOString(),
+    reason
+  });
 }
 
 async function appendLog(message, level = "info") {
@@ -741,11 +1211,57 @@ function buildPageSettings(settings) {
   };
 }
 
+function sanitizeSettings(rawSettings) {
+  return {
+    startupDelayMs: clampInt(rawSettings.startupDelayMs, 0, 120000, DEFAULT_SETTINGS.startupDelayMs),
+    cooldownMs: clampInt(rawSettings.cooldownMs, 0, 120000, DEFAULT_SETTINGS.cooldownMs),
+    retryDelayMs: clampInt(rawSettings.retryDelayMs, 0, 300000, DEFAULT_SETTINGS.retryDelayMs),
+    stableMs: clampInt(rawSettings.stableMs, 500, 20000, DEFAULT_SETTINGS.stableMs),
+    pollIntervalMs: clampInt(rawSettings.pollIntervalMs, 250, 10000, DEFAULT_SETTINGS.pollIntervalMs),
+    completionTimeoutMs: clampInt(rawSettings.completionTimeoutMs, 5000, 600000, DEFAULT_SETTINGS.completionTimeoutMs),
+    lookupTimeoutMs: clampInt(rawSettings.lookupTimeoutMs, 1000, 60000, DEFAULT_SETTINGS.lookupTimeoutMs),
+    submitConfirmTimeoutMs: clampInt(rawSettings.submitConfirmTimeoutMs, 1000, 60000, DEFAULT_SETTINGS.submitConfirmTimeoutMs),
+    maxRetries: clampInt(rawSettings.maxRetries, 0, 10, DEFAULT_SETTINGS.maxRetries)
+  };
+}
+
+function clampInt(value, min, max, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+
+  return Math.min(max, Math.max(min, Math.round(parsed)));
+}
+
+function contentReadyReason(reason, ready) {
+  if (ready) {
+    return "ChatGPT tab connected.";
+  }
+
+  switch (reason) {
+    case "route-change":
+      return "Route changed. Waiting for ready UI.";
+    case "visible":
+      return "Tab visible. Checking composer.";
+    case "load":
+      return "Page loaded. Checking composer.";
+    default:
+      return "ChatGPT tab connected. Waiting for ready UI.";
+  }
+}
+
 function getQueuePosition(queue, itemId) {
   const index = queue.findIndex((item) => item.id === itemId);
   return index === -1 ? "?" : index + 1;
 }
 
 function isChatGPTUrl(url) {
-  return typeof url === "string" && url.startsWith("https://chatgpt.com/");
+  return (
+    typeof url === "string" &&
+    (
+      url.startsWith("https://chatgpt.com/") ||
+      url.startsWith("https://chat.openai.com/")
+    )
+  );
 }
