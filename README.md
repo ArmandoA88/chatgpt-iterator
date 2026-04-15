@@ -26,7 +26,8 @@ Chrome extension scaffold for queueing prompts on supported AI web apps and subm
 - In-page queue panel on ChatGPT web and Gemini web with quick-add and live queue status.
 - Queue items can store prompt text plus attached files/images.
 - Quick add submits with `Enter`, uses `Shift+Enter` for a newline, and item editors accept clipboard image/file paste with `Ctrl+V`.
-- Optional `Auto Save` toggle downloads detected AI-generated text and file/image outputs after each completed prompt.
+- The first quick-add prompt auto-starts immediately when the queue is idle.
+- Optional `Auto Save` toggle downloads detected AI-generated files and images after each completed prompt.
 - Page diagnostics for composer, send button, draft state, and generation state.
 - Best-effort DOM selectors for ChatGPT and Gemini composer, send, stop, upload, and response controls.
 
@@ -41,4 +42,4 @@ This relies on the live DOM of the supported AI websites. Selector changes on Ch
 
 Attachments are serialized into extension storage so they can stay with the queue. Large files can make the extension heavier; the current in-page uploader rejects files over about 15 MB each or 45 MB per edit/add batch.
 
-Auto-save is best-effort. It downloads detected response text plus visible file/image links from the latest assistant response, but site DOM changes or non-downloadable assets can still prevent some saves.
+Auto-save is best-effort. It downloads visible file/image outputs from the latest assistant response, but site DOM changes or non-downloadable assets can still prevent some saves.

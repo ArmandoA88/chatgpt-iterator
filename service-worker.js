@@ -159,7 +159,7 @@ async function handleMessage(message, sender) {
     case "POPUP/ADD_PROMPTS":
       return handleAddPrompts(message.payload || {});
     case "POPUP/START":
-      return handleStart();
+      return handleStart(message.payload || {});
     case "POPUP/PAUSE":
       return handlePause();
     case "POPUP/RESUME":
@@ -302,9 +302,10 @@ async function handleUpdateItem(payload) {
   };
 }
 
-async function handleStart() {
+async function handleStart(options = {}) {
   const state = await getState();
   const canRun = state.currentItemId || state.queue.some((item) => item.status === "queued");
+  const immediate = Boolean(options?.immediate);
 
   if (!canRun) {
     await patchState({
@@ -323,7 +324,7 @@ async function handleStart() {
   });
 
   await appendLog("Queue started.");
-  await scheduleQueueTick(state.currentItemId ? 250 : state.settings.startupDelayMs);
+  await scheduleQueueTick(state.currentItemId ? 250 : immediate ? 0 : state.settings.startupDelayMs);
 
   return {
     ok: true
@@ -1538,11 +1539,10 @@ async function autoSavePromptOutputs(item, rawOutput) {
   }
 
   const output = normalizeOutputPayload(rawOutput);
-  const hasText = Boolean(output.text.trim());
   const assets = output.assets;
 
-  if (!hasText && !assets.length) {
-    await appendLog("Prompt completed but no savable output was detected.", "warn");
+  if (!assets.length) {
+    await appendLog("Prompt completed but no savable files or images were detected.", "warn");
     return {
       savedAt: null,
       message: null
@@ -1551,16 +1551,6 @@ async function autoSavePromptOutputs(item, rawOutput) {
 
   const baseName = buildOutputBaseName(item, output);
   let downloadCount = 0;
-
-  if (hasText) {
-    await chrome.downloads.download({
-      url: buildTextDownloadUrl(buildTextSaveContents(item, output)),
-      filename: `AI Queue Iterator/${sanitizeFilename(output.provider || "Assistant")}/${baseName}.txt`,
-      saveAs: false,
-      conflictAction: "uniquify"
-    });
-    downloadCount += 1;
-  }
 
   for (let index = 0; index < assets.length; index += 1) {
     const asset = assets[index];
@@ -1581,6 +1571,14 @@ async function autoSavePromptOutputs(item, rawOutput) {
       console.warn("[service-worker] asset download failed", error);
       await appendLog(`Auto-save skipped one asset: ${error.message}`, "warn");
     }
+  }
+
+  if (!downloadCount) {
+    await appendLog("Prompt completed but no output files or images could be downloaded.", "warn");
+    return {
+      savedAt: null,
+      message: null
+    };
   }
 
   const savedAt = new Date().toISOString();
@@ -1640,23 +1638,6 @@ function buildOutputBaseName(item, output) {
   const source = item.text || output.text || "response";
   const snippet = sanitizeFilename(source).slice(0, 56) || "response";
   return `${timestamp}-${snippet}`;
-}
-
-function buildTextSaveContents(item, output) {
-  return [
-    `Provider: ${output.provider || "Assistant"}`,
-    `Completed At: ${item.finishedAt || new Date().toISOString()}`,
-    "",
-    "Prompt:",
-    item.text || "(attachment-only prompt)",
-    "",
-    "Response:",
-    output.text.trim() || "(no text detected)"
-  ].join("\r\n");
-}
-
-function buildTextDownloadUrl(text) {
-  return `data:text/plain;charset=utf-8,${encodeURIComponent(text)}`;
 }
 
 function inferAssetFilename(asset, index, baseName) {

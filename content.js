@@ -2205,6 +2205,7 @@ async function handleOverlayAddPrompts() {
     return;
   }
 
+  const shouldAutoStart = shouldAutoStartQuickAdd();
   const prompts = splitPromptBatch(overlayUi.quickAddInput.value);
   if (!prompts.length && !overlayAddAttachments.length) {
     return;
@@ -2219,7 +2220,27 @@ async function handleOverlayAddPrompts() {
     overlayUi.quickAddFiles.value = "";
     overlayAddAttachments = [];
     renderQuickAddAttachments();
+
+    if (shouldAutoStart) {
+      await requestOverlayCommand("POPUP/START", {
+        immediate: true
+      });
+    }
   }
+}
+
+function shouldAutoStartQuickAdd() {
+  const state = overlayLastRenderedState;
+  if (!state) {
+    return false;
+  }
+
+  const queueLength = Array.isArray(state.queue) ? state.queue.length : 0;
+  return (
+    queueLength === 0 &&
+    !state.currentItemId &&
+    state.runState !== "running"
+  );
 }
 
 async function requestOverlayCommand(type, payload = undefined) {
