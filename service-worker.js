@@ -22,6 +22,7 @@ const DEFAULT_SETTINGS = {
 };
 
 const DEFAULT_PAGE_STATUS = {
+  provider: null,
   connected: false,
   ready: false,
   composerFound: false,
@@ -29,7 +30,7 @@ const DEFAULT_PAGE_STATUS = {
   generating: false,
   draftPresent: false,
   lastCheckedAt: null,
-  reason: "Waiting for a ChatGPT tab."
+  reason: "Waiting for a supported AI tab."
 };
 
 const DEFAULT_STATE = {
@@ -47,7 +48,7 @@ const QUEUE_TICK_ALARM = "queueTick";
 
 chrome.runtime.onInstalled.addListener(async () => {
   await ensureState();
-  await appendLog("Extension installed. Open ChatGPT in Chrome to start.");
+  await appendLog("Extension installed. Open ChatGPT or Gemini in Chrome to start.");
 });
 
 chrome.runtime.onStartup.addListener(async () => {
@@ -57,7 +58,7 @@ chrome.runtime.onStartup.addListener(async () => {
 chrome.action.onClicked.addListener(async (tab) => {
   await ensureState();
 
-  if (tab?.id && isChatGPTUrl(tab.url)) {
+  if (tab?.id && isSupportedAssistantUrl(tab.url)) {
     await safeSendToTab(tab.id, {
       type: "OVERLAY/TOGGLE"
     });
@@ -69,7 +70,7 @@ chrome.action.onClicked.addListener(async (tab) => {
     return;
   }
 
-  const existingTab = await findChatGPTTab();
+  const existingTab = await findSupportedAssistantTab();
   if (existingTab?.id) {
     await chrome.tabs.update(existingTab.id, { active: true });
 
@@ -115,21 +116,21 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 
   await patchState({
     activeTabId: null,
-    pageStatus: buildDisconnectedPageStatus("Tracked ChatGPT tab closed."),
-    lastStatus: "Tracked ChatGPT tab closed."
+    pageStatus: buildDisconnectedPageStatus("Tracked AI tab closed."),
+    lastStatus: "Tracked AI tab closed."
   });
 
-  await appendLog("Tracked ChatGPT tab closed.", "warn");
+  await appendLog("Tracked AI tab closed.", "warn");
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  if (changeInfo.status !== "complete" || !isChatGPTUrl(tab.url)) {
+  if (changeInfo.status !== "complete" || !isSupportedAssistantUrl(tab.url)) {
     return;
   }
 
   const state = await getState();
   if (state.activeTabId === tabId) {
-    await refreshPageStatusForTab(tabId, "ChatGPT tab refreshed.");
+    await refreshPageStatusForTab(tabId, "AI tab refreshed.");
 
     if (state.runState === "running") {
       await scheduleQueueTick(1000);
@@ -178,6 +179,8 @@ async function handleMessage(message, sender) {
       return handleClearCompleted();
     case "POPUP/CLEAR_ALL":
       return handleClearAll();
+    case "POPUP/RERUN_ALL":
+      return handleRerunAll();
     case "POPUP/SAVE_SETTINGS":
       return handleSaveSettings(message.payload?.settings ?? {});
     case "POPUP/REFRESH_PAGE_STATUS":
@@ -618,15 +621,78 @@ async function handleClearCompleted() {
 }
 
 async function handleClearAll() {
+  const state = await getState();
+
   await chrome.alarms.clear(QUEUE_TICK_ALARM);
+
+  if (state.currentItemId && state.activeTabId) {
+    await safeSendToTab(state.activeTabId, {
+      type: "CONTENT/ABORT"
+    });
+  }
+
   await chrome.storage.local.set({
     queue: [],
     currentItemId: null,
     runState: "idle",
-    lastStatus: "Queue cleared."
+    lastStatus: "Queue cleared.",
+    pageStatus: normalizePageStatus({
+      ...state.pageStatus,
+      generating: false,
+      lastCheckedAt: new Date().toISOString(),
+      reason: "Queue cleared."
+    })
   });
 
   await appendLog("Queue cleared.");
+
+  return {
+    ok: true
+  };
+}
+
+async function handleRerunAll() {
+  const state = await getState();
+
+  if (!state.queue.length) {
+    return {
+      ok: false,
+      error: "Queue is empty."
+    };
+  }
+
+  await chrome.alarms.clear(QUEUE_TICK_ALARM);
+
+  if (state.currentItemId && state.activeTabId) {
+    await safeSendToTab(state.activeTabId, {
+      type: "CONTENT/ABORT"
+    });
+  }
+
+  const queue = state.queue.map((item) => ({
+    ...item,
+    status: "queued",
+    startedAt: null,
+    finishedAt: null,
+    retryCount: 0,
+    lastError: null
+  }));
+
+  await chrome.storage.local.set({
+    queue,
+    currentItemId: null,
+    runState: "running",
+    lastStatus: "All prompts requeued. Restarting queue.",
+    pageStatus: normalizePageStatus({
+      ...state.pageStatus,
+      generating: false,
+      lastCheckedAt: new Date().toISOString(),
+      reason: "All prompts requeued. Restarting queue."
+    })
+  });
+
+  await appendLog("All prompts requeued. Restarting queue.");
+  await scheduleQueueTick(state.settings.startupDelayMs);
 
   return {
     ok: true
@@ -655,10 +721,10 @@ async function handleSaveSettings(rawSettings) {
 
 async function handleRefreshPageStatus() {
   const state = await getState();
-  const tab = await findChatGPTTab(state.activeTabId);
+  const tab = await findSupportedAssistantTab(state.activeTabId);
 
   if (!tab?.id) {
-    const pageStatus = buildDisconnectedPageStatus("Open a ChatGPT tab to continue.");
+    const pageStatus = buildDisconnectedPageStatus("Open a ChatGPT or Gemini tab to continue.");
     await patchState({
       activeTabId: null,
       pageStatus,
@@ -687,10 +753,10 @@ async function handleContentReady(payload, sender) {
   const tabId = sender.tab?.id ?? null;
   const url = sender.tab?.url ?? "";
 
-  if (!tabId || !isChatGPTUrl(url)) {
+  if (!tabId || !isSupportedAssistantUrl(url)) {
     return {
       ok: false,
-      error: "Content script is not attached to a supported ChatGPT tab."
+      error: "Content script is not attached to a supported AI tab."
     };
   }
 
@@ -704,7 +770,7 @@ async function handleContentReady(payload, sender) {
   await patchState({
     activeTabId: tabId,
     pageStatus,
-    lastStatus: pageStatus.ready ? "ChatGPT tab connected." : pageStatus.reason
+    lastStatus: pageStatus.ready ? `${pageStatus.provider || "Assistant"} tab connected.` : pageStatus.reason
   });
 
   const state = await getState();
@@ -851,7 +917,7 @@ async function processQueue(source) {
   }
 
   if (state.currentItemId) {
-    const tab = await findChatGPTTab(state.activeTabId);
+    const tab = await findSupportedAssistantTab(state.activeTabId);
     if (tab?.id) {
       await safeSendToTab(tab.id, {
         type: "CONTENT/RESUME_MONITOR",
@@ -882,9 +948,9 @@ async function processQueue(source) {
     return;
   }
 
-  const tab = await findChatGPTTab(state.activeTabId);
+  const tab = await findSupportedAssistantTab(state.activeTabId);
   if (!tab?.id) {
-    const pageStatus = buildDisconnectedPageStatus("Open a ChatGPT tab to continue.");
+    const pageStatus = buildDisconnectedPageStatus("Open a ChatGPT or Gemini tab to continue.");
 
     await patchState({
       activeTabId: null,
@@ -892,7 +958,7 @@ async function processQueue(source) {
       lastStatus: pageStatus.reason
     });
 
-    await appendLog("No supported ChatGPT tab available.", "warn");
+    await appendLog("No supported AI tab available.", "warn");
     return;
   }
 
@@ -905,7 +971,7 @@ async function processQueue(source) {
       connected: true,
       ready: false,
       lastCheckedAt: new Date().toISOString(),
-      reason: "ChatGPT page is not ready yet."
+      reason: "Assistant page is not ready yet."
     });
 
     await patchState({
@@ -914,7 +980,7 @@ async function processQueue(source) {
       lastStatus: pageStatus.reason
     });
 
-    await appendLog("ChatGPT page is not ready yet.", "warn");
+    await appendLog("Assistant page is not ready yet.", "warn");
     await scheduleQueueTick(2500);
     return;
   }
@@ -1080,11 +1146,11 @@ async function refreshPageStatusForTab(tabId, reason) {
   return pageStatus;
 }
 
-async function findChatGPTTab(preferredTabId) {
+async function findSupportedAssistantTab(preferredTabId) {
   if (preferredTabId) {
     try {
       const preferred = await chrome.tabs.get(preferredTabId);
-      if (preferred?.id && isChatGPTUrl(preferred.url)) {
+      if (preferred?.id && isSupportedAssistantUrl(preferred.url)) {
         return preferred;
       }
     } catch (error) {
@@ -1093,7 +1159,11 @@ async function findChatGPTTab(preferredTabId) {
   }
 
   const tabs = await chrome.tabs.query({
-    url: ["https://chatgpt.com/*", "https://chat.openai.com/*"]
+    url: [
+      "https://chatgpt.com/*",
+      "https://chat.openai.com/*",
+      "https://gemini.google.com/*"
+    ]
   });
 
   if (!tabs.length) {
@@ -1173,6 +1243,7 @@ function normalizePageStatus(rawPageStatus) {
 
 function buildDisconnectedPageStatus(reason) {
   return normalizePageStatus({
+    provider: null,
     connected: false,
     ready: false,
     composerFound: false,
@@ -1236,7 +1307,7 @@ function clampInt(value, min, max, fallback) {
 
 function contentReadyReason(reason, ready) {
   if (ready) {
-    return "ChatGPT tab connected.";
+    return "Assistant tab connected.";
   }
 
   switch (reason) {
@@ -1247,7 +1318,7 @@ function contentReadyReason(reason, ready) {
     case "load":
       return "Page loaded. Checking composer.";
     default:
-      return "ChatGPT tab connected. Waiting for ready UI.";
+      return "Assistant tab connected. Waiting for ready UI.";
   }
 }
 
@@ -1256,12 +1327,13 @@ function getQueuePosition(queue, itemId) {
   return index === -1 ? "?" : index + 1;
 }
 
-function isChatGPTUrl(url) {
+function isSupportedAssistantUrl(url) {
   return (
     typeof url === "string" &&
     (
       url.startsWith("https://chatgpt.com/") ||
-      url.startsWith("https://chat.openai.com/")
+      url.startsWith("https://chat.openai.com/") ||
+      url.startsWith("https://gemini.google.com/")
     )
   );
 }

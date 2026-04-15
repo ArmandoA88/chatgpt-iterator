@@ -1,27 +1,93 @@
-const COMPOSER_SELECTORS = [
+const CHATGPT_COMPOSER_SELECTORS = [
   "form textarea",
   "textarea[data-testid]",
   "textarea[placeholder]",
   "textarea",
   "[contenteditable='true'][data-lexical-editor='true']",
+  "[contenteditable='true'][role='textbox']"
+];
+
+const GEMINI_COMPOSER_SELECTORS = [
+  "rich-textarea div[contenteditable='true']",
+  "div[contenteditable='true'][aria-label]",
+  "div[contenteditable='true'][data-placeholder]",
+  "textarea[aria-label]",
+  "textarea[data-placeholder]"
+];
+
+const GENERIC_COMPOSER_SELECTORS = [
+  "[contenteditable='true'][data-lexical-editor='true']",
   "[contenteditable='true'][role='textbox']",
   "[contenteditable='true']"
 ];
 
-const SEND_BUTTON_SELECTORS = [
+const CHATGPT_SEND_BUTTON_SELECTORS = [
   "form button[data-testid*='send']",
   "form button[aria-label*='Send']",
   "form button[aria-label*='send']",
   "form button[type='submit']",
+  "button[data-testid*='send']"
+];
+
+const GEMINI_SEND_BUTTON_SELECTORS = [
+  "button[aria-label*='Send']",
+  "button[aria-label*='send']",
+  "button[aria-label*='Submit']",
+  "button[aria-label*='submit']",
+  "button[mattooltip*='Send']",
+  "button[mattooltip*='send']",
+  "button[data-test-id*='send']"
+];
+
+const GENERIC_SEND_BUTTON_SELECTORS = [
   "button[data-testid*='send']",
   "button[aria-label*='Send']",
   "button[aria-label*='send']"
 ];
 
-const STOP_BUTTON_SELECTORS = [
+const CHATGPT_STOP_BUTTON_SELECTORS = [
   "button[aria-label*='Stop']",
   "button[aria-label*='stop']",
   "button[data-testid*='stop']"
+];
+
+const GEMINI_STOP_BUTTON_SELECTORS = [
+  "button[aria-label*='Stop']",
+  "button[aria-label*='stop']",
+  "button[mattooltip*='Stop']",
+  "button[mattooltip*='stop']",
+  "button[data-test-id*='stop']"
+];
+
+const GENERIC_STOP_BUTTON_SELECTORS = [
+  "button[aria-label*='Stop']",
+  "button[aria-label*='stop']"
+];
+
+const CHATGPT_RESPONSE_SELECTORS = [
+  "[data-message-author-role='assistant']",
+  "main article",
+  "main [role='article']"
+];
+
+const GEMINI_RESPONSE_SELECTORS = [
+  "model-response",
+  "message-content",
+  "main .response-content",
+  "main [data-test-id*='response']",
+  "main [class*='response']"
+];
+
+const GENERIC_RESPONSE_SELECTORS = [
+  "main article",
+  "main [role='article']"
+];
+
+const GENERATING_INDICATOR_SELECTORS = [
+  "main [role='progressbar']",
+  "main mat-progress-spinner",
+  "main md-progress-circular",
+  "main [data-test-id*='loading']"
 ];
 
 const OVERLAY_STORAGE_KEYS = [
@@ -32,12 +98,15 @@ const OVERLAY_STORAGE_KEYS = [
   "pageStatus"
 ];
 
+const INVALIDATED_EXTENSION_PATTERN = /Extension context invalidated/i;
+
 let monitorState = null;
 let lastKnownUrl = location.href;
 let overlayUi = null;
 let overlayDisplayState = {
   collapsed: false
 };
+let extensionContextAlive = true;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "PAGE/PING") {
@@ -131,19 +200,20 @@ function bootstrap() {
 
 async function notifyReady(reason) {
   try {
-    await chrome.runtime.sendMessage({
+    await sendExtensionMessage({
       type: "CONTENT/READY",
       payload: {
         reason,
         status: buildPageStatus()
       }
-    });
+    }, { quiet: true });
   } catch (error) {
     console.debug("[content] ready notification skipped", error);
   }
 }
 
 function buildPageStatus() {
+  const provider = getCurrentProvider();
   const composer = findComposer();
   const sendButton = composer ? findSendButton(composer) : findSendButton();
   const draftPresent = composer ? Boolean(readComposerText(composer).trim()) : false;
@@ -151,7 +221,8 @@ function buildPageStatus() {
 
   return {
     ok: true,
-    ready: Boolean(composer) && !generating && !draftPresent,
+    provider,
+    ready: Boolean(composer) && !generating,
     composerFound: Boolean(composer),
     sendButtonFound: Boolean(sendButton),
     generating,
@@ -163,6 +234,7 @@ async function submitPrompt(payload) {
   const itemId = payload?.itemId;
   const text = String(payload?.text || "");
   const settings = buildSettings(payload?.settings);
+  const provider = getCurrentProvider();
 
   if (!itemId || !text.trim()) {
     return {
@@ -185,7 +257,7 @@ async function submitPrompt(payload) {
     return {
       ok: false,
       accepted: false,
-      error: "Could not find the ChatGPT composer."
+      error: `Could not find the ${provider} composer.`
     };
   }
 
@@ -209,28 +281,17 @@ async function submitPrompt(payload) {
 
   await sleep(180);
 
-  const sendButton = findSendButton(composer);
-  if (!sendButton) {
-    return {
-      ok: false,
-      accepted: false,
-      error: "Could not find an enabled send button."
-    };
-  }
-
   const preSubmitSnapshot = getAssistantSnapshot();
-  clickElement(sendButton);
-
-  const started = await waitForGenerationStart(settings.submitConfirmTimeoutMs, preSubmitSnapshot);
+  const started = await triggerPromptSubmission(composer, preSubmitSnapshot, settings.submitConfirmTimeoutMs);
   if (!started) {
     return {
       ok: false,
       accepted: false,
-      error: "The page did not enter generation mode after send."
+      error: "Could not trigger prompt submission."
     };
   }
 
-  await chrome.runtime.sendMessage({
+  await sendExtensionMessage({
     type: "CONTENT/SUBMITTED",
     payload: { itemId }
   });
@@ -314,7 +375,7 @@ async function tickMonitor() {
   if (pageIdle) {
     const itemId = monitorState.itemId;
     abortCurrentRun();
-    await chrome.runtime.sendMessage({
+    await sendExtensionMessage({
       type: "CONTENT/DONE",
       payload: { itemId }
     });
@@ -323,12 +384,13 @@ async function tickMonitor() {
 
   if (elapsedMs >= monitorState.settings.completionTimeoutMs) {
     const itemId = monitorState.itemId;
+    const provider = getCurrentProvider();
     abortCurrentRun();
-    await chrome.runtime.sendMessage({
+    await sendExtensionMessage({
       type: "CONTENT/FAILED",
       payload: {
         itemId,
-        reason: "Timed out while waiting for ChatGPT to finish."
+        reason: `Timed out while waiting for ${provider} to finish.`
       }
     });
   }
@@ -352,11 +414,17 @@ function abortCurrentRun(options = {}) {
 }
 
 function findComposer() {
-  const candidates = COMPOSER_SELECTORS
-    .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
-    .filter((element) => isUsableComposer(element));
+  const candidates = getComposerSelectors()
+    .flatMap((selector) => queryAllDeep(selector))
+    .filter((element, index, array) => array.indexOf(element) === index)
+    .filter((element) => isUsableComposer(element))
+    .map((element) => ({
+      element,
+      score: scoreComposer(element)
+    }))
+    .sort((left, right) => right.score - left.score);
 
-  return candidates[0] || null;
+  return candidates[0]?.element || null;
 }
 
 function isUsableComposer(element) {
@@ -399,14 +467,7 @@ function writeComposerText(composer, text) {
     }
 
     descriptor.set.call(composer, text);
-    composer.dispatchEvent(new InputEvent("input", {
-      bubbles: true,
-      data: text,
-      inputType: "insertText"
-    }));
-    composer.dispatchEvent(new Event("change", {
-      bubbles: true
-    }));
+    dispatchSyntheticInputEvents(composer, text);
 
     return readComposerText(composer).trim() === text.trim();
   }
@@ -422,13 +483,11 @@ function writeComposerText(composer, text) {
     }
 
     if (!inserted) {
-      composer.textContent = text;
-      composer.dispatchEvent(new InputEvent("input", {
-        bubbles: true,
-        data: text,
-        inputType: "insertText"
-      }));
+      composer.replaceChildren(document.createTextNode(text));
     }
+
+    dispatchSyntheticInputEvents(composer, text);
+    moveCaretToEnd(composer);
 
     return readComposerText(composer).trim() === text.trim();
   }
@@ -442,14 +501,26 @@ function findSendButton(composer = null) {
   if (form) {
     roots.push(form);
   }
+  if (composer?.parentElement) {
+    roots.push(composer.parentElement);
+  }
+  const nearbyContainer = composer?.closest?.("form, footer, main, rich-textarea");
+  if (nearbyContainer) {
+    roots.push(nearbyContainer);
+  }
   roots.push(document);
 
   for (const root of roots) {
-    for (const selector of SEND_BUTTON_SELECTORS) {
-      const button = Array.from(root.querySelectorAll(selector)).find(isUsableSendButton);
+    for (const selector of getSendButtonSelectors()) {
+      const button = queryAllDeep(selector, root).find(isUsableSendButton);
       if (button) {
         return button;
       }
+    }
+
+    const heuristicButton = findHeuristicSendButton(root);
+    if (heuristicButton) {
+      return heuristicButton;
     }
   }
 
@@ -457,15 +528,15 @@ function findSendButton(composer = null) {
 }
 
 function isUsableSendButton(button) {
-  if (!(button instanceof HTMLButtonElement)) {
+  if (!(button instanceof HTMLElement)) {
     return false;
   }
 
-  if (!isVisible(button) || button.disabled) {
+  if (!isVisible(button) || isDisabledElement(button)) {
     return false;
   }
 
-  const label = button.getAttribute("aria-label") || button.innerText || "";
+  const label = getElementDescriptor(button);
   if (/stop/i.test(label)) {
     return false;
   }
@@ -473,18 +544,66 @@ function isUsableSendButton(button) {
   return true;
 }
 
+function findHeuristicSendButton(root) {
+  const candidates = queryAllDeep("button, [role='button']", root)
+    .filter((button) => isUsableSendButton(button))
+    .map((button) => ({
+      button,
+      score: scoreSendButton(button)
+    }))
+    .filter((entry) => entry.score > 0)
+    .sort((left, right) => right.score - left.score);
+
+  return candidates[0]?.button || null;
+}
+
+function scoreSendButton(button) {
+  const label = getElementDescriptor(button);
+
+  if (/stop|voice|microphone|record|attach|upload|plus|tool|search|canvas|reason|deep research|read aloud/.test(label)) {
+    return -1;
+  }
+
+  let score = 0;
+
+  if ("type" in button && button.type === "submit") {
+    score += 120;
+  }
+
+  if (/send|submit/.test(label)) {
+    score += 90;
+  }
+
+  if (/run|generate/.test(label)) {
+    score += 40;
+  }
+
+  if (!label.trim()) {
+    score += 12;
+  }
+
+  if (button.querySelector("svg")) {
+    score += 10;
+  }
+
+  const rect = button.getBoundingClientRect();
+  score += rect.right / 100;
+
+  return score;
+}
+
 function findStopButton() {
-  for (const selector of STOP_BUTTON_SELECTORS) {
-    const button = Array.from(document.querySelectorAll(selector)).find((entry) => {
-      if (!(entry instanceof HTMLButtonElement)) {
+  for (const selector of getStopButtonSelectors()) {
+    const button = queryAllDeep(selector).find((entry) => {
+      if (!(entry instanceof HTMLElement)) {
         return false;
       }
 
-      if (!isVisible(entry) || entry.disabled) {
+      if (!isVisible(entry) || isDisabledElement(entry)) {
         return false;
       }
 
-      const label = entry.getAttribute("aria-label") || entry.innerText || "";
+      const label = getElementDescriptor(entry);
       return /stop/i.test(label);
     });
 
@@ -501,7 +620,15 @@ function isGenerating() {
     return true;
   }
 
-  const liveRegion = Array.from(document.querySelectorAll("[aria-live='polite'], [aria-live='assertive']")).find((node) => {
+  const progressIndicator = GENERATING_INDICATOR_SELECTORS
+    .flatMap((selector) => queryAllDeep(selector))
+    .find((element) => isVisible(element));
+
+  if (progressIndicator) {
+    return true;
+  }
+
+  const liveRegion = queryAllDeep("[aria-live='polite'], [aria-live='assertive']").find((node) => {
     const text = node.textContent || "";
     return /thinking|generating|streaming/i.test(text);
   });
@@ -510,9 +637,10 @@ function isGenerating() {
 }
 
 function getAssistantSnapshot() {
-  const candidates = Array.from(
-    document.querySelectorAll("[data-message-author-role='assistant'], main article, main [role='article']")
-  ).filter((element) => isVisible(element));
+  const candidates = getResponseSelectors()
+    .flatMap((selector) => queryAllDeep(selector))
+    .filter((element, index, array) => array.indexOf(element) === index)
+    .filter((element) => isVisible(element));
 
   if (!candidates.length) {
     return "";
@@ -521,6 +649,108 @@ function getAssistantSnapshot() {
   const lastCandidate = candidates[candidates.length - 1];
   const text = lastCandidate.innerText || lastCandidate.textContent || "";
   return text.trim().slice(-4000);
+}
+
+function getCurrentProvider(url = location.href) {
+  if (typeof url !== "string") {
+    return "Assistant";
+  }
+
+  if (url.startsWith("https://gemini.google.com/")) {
+    return "Gemini";
+  }
+
+  if (url.startsWith("https://chatgpt.com/") || url.startsWith("https://chat.openai.com/")) {
+    return "ChatGPT";
+  }
+
+  return "Assistant";
+}
+
+function getComposerSelectors() {
+  const provider = getCurrentProvider();
+
+  if (provider === "Gemini") {
+    return [...GEMINI_COMPOSER_SELECTORS, ...GENERIC_COMPOSER_SELECTORS];
+  }
+
+  return [...CHATGPT_COMPOSER_SELECTORS, ...GENERIC_COMPOSER_SELECTORS];
+}
+
+function getSendButtonSelectors() {
+  const provider = getCurrentProvider();
+
+  if (provider === "Gemini") {
+    return [...GEMINI_SEND_BUTTON_SELECTORS, ...GENERIC_SEND_BUTTON_SELECTORS];
+  }
+
+  return [...CHATGPT_SEND_BUTTON_SELECTORS, ...GENERIC_SEND_BUTTON_SELECTORS];
+}
+
+function getStopButtonSelectors() {
+  const provider = getCurrentProvider();
+
+  if (provider === "Gemini") {
+    return [...GEMINI_STOP_BUTTON_SELECTORS, ...GENERIC_STOP_BUTTON_SELECTORS];
+  }
+
+  return [...CHATGPT_STOP_BUTTON_SELECTORS, ...GENERIC_STOP_BUTTON_SELECTORS];
+}
+
+function getResponseSelectors() {
+  const provider = getCurrentProvider();
+
+  if (provider === "Gemini") {
+    return [...GEMINI_RESPONSE_SELECTORS, ...GENERIC_RESPONSE_SELECTORS];
+  }
+
+  return [...CHATGPT_RESPONSE_SELECTORS, ...GENERIC_RESPONSE_SELECTORS];
+}
+
+function scoreComposer(element) {
+  const label = [
+    element.getAttribute("aria-label"),
+    element.getAttribute("placeholder"),
+    element.getAttribute("data-placeholder"),
+    element.textContent
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  let score = 0;
+
+  if (element instanceof HTMLTextAreaElement) {
+    score += 25;
+  }
+
+  if (element.isContentEditable) {
+    score += 20;
+  }
+
+  if (element.closest("form")) {
+    score += 30;
+  }
+
+  if (element.closest("footer")) {
+    score += 15;
+  }
+
+  if (getCurrentProvider() === "Gemini" && element.closest("rich-textarea")) {
+    score += 60;
+  }
+
+  if (/prompt|message|ask|type|write|enter/.test(label)) {
+    score += 80;
+  }
+
+  const rect = element.getBoundingClientRect();
+  if (rect.width > 120) {
+    score += 5;
+  }
+  score += rect.bottom / 200;
+
+  return score;
 }
 
 async function waitForComposer(timeoutMs) {
@@ -562,6 +792,91 @@ async function waitForGenerationStart(timeoutMs, preSubmitSnapshot) {
   return false;
 }
 
+async function triggerPromptSubmission(composer, preSubmitSnapshot, timeoutMs) {
+  const startTime = Date.now();
+  const form = composer?.closest?.("form") || null;
+
+  const attempts = [
+    async () => {
+      const sendButton = findSendButton(composer);
+      if (!sendButton) {
+        return false;
+      }
+
+      clickElement(sendButton);
+      return waitForGenerationStart(remainingAttemptMs(startTime, timeoutMs), preSubmitSnapshot);
+    },
+    async () => {
+      if (!form) {
+        return false;
+      }
+
+      try {
+        if (typeof form.requestSubmit === "function") {
+          form.requestSubmit();
+        } else {
+          form.dispatchEvent(new Event("submit", {
+            bubbles: true,
+            cancelable: true
+          }));
+        }
+      } catch (error) {
+        return false;
+      }
+
+      return waitForGenerationStart(remainingAttemptMs(startTime, timeoutMs), preSubmitSnapshot);
+    },
+    async () => {
+      dispatchEnterSubmit(composer);
+      return waitForGenerationStart(remainingAttemptMs(startTime, timeoutMs), preSubmitSnapshot);
+    },
+    async () => {
+      dispatchEnterSubmit(composer, { ctrlKey: true, metaKey: false });
+      return waitForGenerationStart(remainingAttemptMs(startTime, timeoutMs), preSubmitSnapshot);
+    },
+    async () => {
+      dispatchEnterSubmit(composer, { ctrlKey: false, metaKey: true });
+      return waitForGenerationStart(remainingAttemptMs(startTime, timeoutMs), preSubmitSnapshot);
+    }
+  ];
+
+  for (const attempt of attempts) {
+    if (remainingAttemptMs(startTime, timeoutMs) <= 0) {
+      return false;
+    }
+
+    const started = await attempt();
+    if (started) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function remainingAttemptMs(startTime, totalTimeoutMs) {
+  return Math.max(800, totalTimeoutMs - (Date.now() - startTime));
+}
+
+function dispatchEnterSubmit(composer, modifiers = {}) {
+  composer.focus();
+
+  const keyboardEventInit = {
+    bubbles: true,
+    cancelable: true,
+    key: "Enter",
+    code: "Enter",
+    which: 13,
+    keyCode: 13,
+    ctrlKey: Boolean(modifiers.ctrlKey),
+    metaKey: Boolean(modifiers.metaKey)
+  };
+
+  composer.dispatchEvent(new KeyboardEvent("keydown", keyboardEventInit));
+  composer.dispatchEvent(new KeyboardEvent("keypress", keyboardEventInit));
+  composer.dispatchEvent(new KeyboardEvent("keyup", keyboardEventInit));
+}
+
 function selectElementContents(element) {
   const selection = window.getSelection();
   const range = document.createRange();
@@ -571,10 +886,141 @@ function selectElementContents(element) {
 }
 
 function clickElement(element) {
+  element.dispatchEvent(new PointerEvent("pointerover", { bubbles: true }));
+  element.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
   element.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
   element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+  element.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
   element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
   element.click();
+}
+
+function dispatchSyntheticInputEvents(element, text) {
+  try {
+    element.dispatchEvent(new InputEvent("beforeinput", {
+      bubbles: true,
+      cancelable: true,
+      data: text,
+      inputType: "insertText"
+    }));
+  } catch (error) {
+    // Some sites reject constructing beforeinput; continue with input/change.
+  }
+
+  element.dispatchEvent(new InputEvent("input", {
+    bubbles: true,
+    data: text,
+    inputType: "insertText"
+  }));
+  element.dispatchEvent(new Event("change", {
+    bubbles: true
+  }));
+}
+
+function moveCaretToEnd(element) {
+  if (!element?.isContentEditable) {
+    return;
+  }
+
+  const selection = window.getSelection();
+  if (!selection) {
+    return;
+  }
+
+  const range = document.createRange();
+  range.selectNodeContents(element);
+  range.collapse(false);
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+function isDisabledElement(element) {
+  return (
+    element.hasAttribute("disabled") ||
+    element.getAttribute("aria-disabled") === "true" ||
+    ("disabled" in element && element.disabled === true)
+  );
+}
+
+function getElementDescriptor(element) {
+  return [
+    element.getAttribute("aria-label"),
+    element.getAttribute("title"),
+    element.getAttribute("data-testid"),
+    element.getAttribute("data-test-id"),
+    element.getAttribute("mattooltip"),
+    element.getAttribute("aria-description"),
+    element.innerText,
+    element.textContent
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+}
+
+function queryAllDeep(selector, startRoot = document) {
+  const results = [];
+  const seen = new Set();
+
+  for (const root of getSearchRoots(startRoot)) {
+    let matches = [];
+
+    try {
+      matches = Array.from(root.querySelectorAll(selector));
+    } catch (error) {
+      matches = [];
+    }
+
+    for (const match of matches) {
+      if (seen.has(match)) {
+        continue;
+      }
+
+      seen.add(match);
+      results.push(match);
+    }
+  }
+
+  return results;
+}
+
+function getSearchRoots(startRoot = document) {
+  const queue = [startRoot];
+  const roots = [];
+  const seen = new Set();
+
+  while (queue.length) {
+    const root = queue.shift();
+    if (!root || seen.has(root) || root === overlayUi?.shadow) {
+      continue;
+    }
+
+    seen.add(root);
+    roots.push(root);
+
+    let elements = [];
+    try {
+      elements = Array.from(root.querySelectorAll("*"));
+    } catch (error) {
+      elements = [];
+    }
+
+    for (const element of elements) {
+      if (!(element instanceof HTMLElement)) {
+        continue;
+      }
+
+      if (element.id === "cgqi-overlay-host") {
+        continue;
+      }
+
+      if (element.shadowRoot) {
+        queue.push(element.shadowRoot);
+      }
+    }
+  }
+
+  return roots;
 }
 
 function isVisible(element) {
@@ -622,20 +1068,20 @@ async function initInPageOverlay() {
 
       .cgqi-root {
         position: fixed;
-        right: 18px;
-        top: 88px;
+        right: 12px;
+        top: 76px;
         z-index: 2147483647;
         font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         color: #ececec;
       }
 
       .cgqi-panel {
-        width: 332px;
-        max-height: calc(100vh - 120px);
+        width: 286px;
+        max-height: calc(100vh - 96px);
         display: grid;
-        gap: 12px;
-        padding: 14px;
-        border-radius: 18px;
+        gap: 9px;
+        padding: 11px;
+        border-radius: 16px;
         border: 1px solid rgba(255, 255, 255, 0.08);
         background:
           linear-gradient(180deg, rgba(28, 28, 30, 0.96), rgba(20, 20, 22, 0.96));
@@ -650,16 +1096,16 @@ async function initInPageOverlay() {
       .cgqi-launcher {
         display: inline-flex;
         align-items: center;
-        gap: 8px;
-        min-height: 42px;
-        padding: 0 14px;
+        gap: 6px;
+        min-height: 36px;
+        padding: 0 12px;
         border: 1px solid rgba(255, 255, 255, 0.1);
         border-radius: 999px;
         background: rgba(18, 18, 19, 0.96);
         color: #f3f3f3;
         cursor: pointer;
         font: inherit;
-        font-size: 13px;
+        font-size: 12px;
         font-weight: 700;
         box-shadow: 0 12px 28px rgba(0, 0, 0, 0.3);
       }
@@ -672,13 +1118,13 @@ async function initInPageOverlay() {
         display: flex;
         align-items: flex-start;
         justify-content: space-between;
-        gap: 12px;
+        gap: 10px;
       }
 
       .cgqi-eyebrow {
-        margin: 0 0 6px;
+        margin: 0 0 4px;
         color: #9ca0aa;
-        font-size: 11px;
+        font-size: 10px;
         font-weight: 700;
         letter-spacing: 0.08em;
         text-transform: uppercase;
@@ -687,9 +1133,9 @@ async function initInPageOverlay() {
       .cgqi-summary {
         margin: 0;
         color: #f5f5f6;
-        font-size: 15px;
+        font-size: 13px;
         font-weight: 700;
-        line-height: 1.35;
+        line-height: 1.3;
       }
 
       .cgqi-icon,
@@ -702,16 +1148,16 @@ async function initInPageOverlay() {
       }
 
       .cgqi-icon {
-        min-height: 30px;
-        padding: 0 12px;
+        min-height: 28px;
+        padding: 0 10px;
         background: rgba(255, 255, 255, 0.06);
         color: #d4d4d8;
-        font-size: 12px;
+        font-size: 11px;
         font-weight: 700;
       }
 
       .cgqi-progress {
-        height: 7px;
+        height: 6px;
         overflow: hidden;
         border-radius: 999px;
         background: rgba(255, 255, 255, 0.06);
@@ -731,18 +1177,18 @@ async function initInPageOverlay() {
       .cgqi-footer-actions {
         display: flex;
         flex-wrap: wrap;
-        gap: 8px;
+        gap: 6px;
       }
 
       .cgqi-chip {
         display: inline-flex;
         align-items: center;
-        min-height: 24px;
-        padding: 0 10px;
+        min-height: 21px;
+        padding: 0 8px;
         border-radius: 999px;
         background: rgba(255, 255, 255, 0.06);
         color: #dadce3;
-        font-size: 11px;
+        font-size: 10px;
         font-weight: 700;
         letter-spacing: 0.04em;
         text-transform: uppercase;
@@ -770,16 +1216,16 @@ async function initInPageOverlay() {
 
       .cgqi-status {
         color: #a5a8b2;
-        font-size: 12px;
-        line-height: 1.45;
+        font-size: 11px;
+        line-height: 1.35;
       }
 
       .cgqi-button {
-        min-height: 34px;
-        padding: 0 12px;
+        min-height: 30px;
+        padding: 0 10px;
         background: rgba(255, 255, 255, 0.08);
         color: #f2f2f3;
-        font-size: 12px;
+        font-size: 11px;
         font-weight: 700;
       }
 
@@ -802,10 +1248,10 @@ async function initInPageOverlay() {
 
       .cgqi-list {
         display: grid;
-        gap: 8px;
-        max-height: 320px;
+        gap: 7px;
+        max-height: 260px;
         overflow: auto;
-        padding-right: 4px;
+        padding-right: 2px;
       }
 
       .cgqi-list::-webkit-scrollbar {
@@ -825,14 +1271,14 @@ async function initInPageOverlay() {
       }
 
       .cgqi-empty {
-        padding: 14px;
+        padding: 12px;
         color: #9ca0aa;
-        font-size: 12px;
-        line-height: 1.5;
+        font-size: 11px;
+        line-height: 1.45;
       }
 
       .cgqi-item {
-        padding: 12px;
+        padding: 10px;
       }
 
       .cgqi-item.is-active {
@@ -848,38 +1294,38 @@ async function initInPageOverlay() {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        gap: 10px;
+        gap: 8px;
       }
 
       .cgqi-item-index {
         color: #8e929d;
-        font-size: 12px;
+        font-size: 11px;
         font-weight: 700;
       }
 
       .cgqi-item-text {
-        margin: 8px 0 6px;
+        margin: 6px 0 5px;
         color: #f3f3f4;
-        font-size: 13px;
-        line-height: 1.45;
+        font-size: 12px;
+        line-height: 1.38;
       }
 
       .cgqi-item-meta {
         color: #8f93a0;
-        font-size: 11px;
-        line-height: 1.45;
+        font-size: 10px;
+        line-height: 1.35;
       }
 
       .cgqi-item-actions {
-        margin-top: 10px;
+        margin-top: 8px;
       }
 
       .cgqi-mini {
-        min-height: 26px;
-        padding: 0 9px;
+        min-height: 24px;
+        padding: 0 8px;
         background: rgba(255, 255, 255, 0.06);
         color: #d7d9df;
-        font-size: 11px;
+        font-size: 10px;
         font-weight: 700;
       }
 
@@ -890,30 +1336,30 @@ async function initInPageOverlay() {
 
       .cgqi-add {
         display: grid;
-        gap: 8px;
-        padding-top: 4px;
+        gap: 7px;
+        padding-top: 2px;
         border-top: 1px solid rgba(255, 255, 255, 0.06);
       }
 
       .cgqi-add-label {
         color: #9ca0aa;
-        font-size: 11px;
+        font-size: 10px;
         font-weight: 700;
         letter-spacing: 0.06em;
         text-transform: uppercase;
       }
 
       .cgqi-input {
-        min-height: 82px;
+        min-height: 64px;
         resize: vertical;
-        padding: 10px 12px;
+        padding: 9px 10px;
         border: 1px solid rgba(255, 255, 255, 0.08);
         border-radius: 12px;
         background: rgba(255, 255, 255, 0.04);
         color: #f5f5f6;
         font: inherit;
-        font-size: 12px;
-        line-height: 1.45;
+        font-size: 11px;
+        line-height: 1.4;
       }
 
       .cgqi-input:focus {
@@ -977,7 +1423,11 @@ async function initInPageOverlay() {
 
   shadow.addEventListener("click", handleOverlayClick);
   shadow.addEventListener("keydown", handleOverlayKeydown);
-  chrome.storage.onChanged.addListener(handleOverlayStorageChange);
+  try {
+    chrome.storage.onChanged.addListener(handleOverlayStorageChange);
+  } catch (error) {
+    handleInvalidatedExtensionContext(error);
+  }
 
   syncOverlayVisibility();
   await renderOverlayFromStorage();
@@ -1008,6 +1458,16 @@ async function handleOverlayClick(event) {
 
   const action = button.dataset.overlayAction;
   const itemId = button.dataset.itemId;
+
+  if (action === "refresh-page" && !extensionContextAlive) {
+    location.reload();
+    return;
+  }
+
+  if (!extensionContextAlive && action !== "toggle") {
+    renderOverlayInvalidatedState("Extension reloaded. Refresh this tab.");
+    return;
+  }
 
   if (action === "toggle") {
     overlayDisplayState.collapsed = !overlayDisplayState.collapsed;
@@ -1053,6 +1513,8 @@ async function handleOverlayClick(event) {
     stop: "POPUP/STOP",
     "retry-current": "POPUP/RETRY_CURRENT",
     "skip-current": "POPUP/SKIP_CURRENT",
+    "clear-all": "POPUP/CLEAR_ALL",
+    "rerun-all": "POPUP/RERUN_ALL",
     "refresh-page": "POPUP/REFRESH_PAGE_STATUS"
   };
 
@@ -1091,9 +1553,11 @@ async function handleOverlayAddPrompts() {
 
 async function requestOverlayCommand(type, payload = undefined) {
   try {
-    return await chrome.runtime.sendMessage(payload ? { type, payload } : { type });
+    return await sendExtensionMessage(payload ? { type, payload } : { type });
   } catch (error) {
-    console.error("[content] overlay command failed", error);
+    if (!isInvalidatedExtensionError(error)) {
+      console.error("[content] overlay command failed", error);
+    }
     return {
       ok: false,
       error: error.message
@@ -1106,7 +1570,18 @@ async function renderOverlayFromStorage() {
     return;
   }
 
-  const rawState = await chrome.storage.local.get(OVERLAY_STORAGE_KEYS);
+  let rawState;
+  try {
+    rawState = await chrome.storage.local.get(OVERLAY_STORAGE_KEYS);
+  } catch (error) {
+    if (isInvalidatedExtensionError(error)) {
+      handleInvalidatedExtensionContext(error);
+      return;
+    }
+
+    throw error;
+  }
+
   renderOverlay({
     queue: Array.isArray(rawState.queue) ? rawState.queue : [],
     runState: rawState.runState || "idle",
@@ -1118,6 +1593,11 @@ async function renderOverlayFromStorage() {
 
 function renderOverlay(state) {
   if (!overlayUi) {
+    return;
+  }
+
+  if (!extensionContextAlive) {
+    renderOverlayInvalidatedState("Extension reloaded. Refresh this tab.");
     return;
   }
 
@@ -1166,9 +1646,30 @@ function showOverlay() {
   }
 }
 
+function renderOverlayInvalidatedState(message) {
+  if (!overlayUi) {
+    return;
+  }
+
+  overlayUi.summary.textContent = "Extension reloaded.";
+  overlayUi.progressFill.style.width = "0%";
+  overlayUi.chips.innerHTML = `
+    <span class="cgqi-chip is-bad">reload required</span>
+  `;
+  overlayUi.status.textContent = message;
+  overlayUi.controls.innerHTML = overlayButton("refresh-page", "Reload Tab", false, true);
+  overlayUi.queueList.innerHTML = `
+    <div class="cgqi-empty">This page still has the old content script. Refresh the tab to reconnect the extension.</div>
+  `;
+}
+
 function buildOverlayChips(runState, pageStatus, activeIndex) {
   const chips = [];
   chips.push(`<span class="cgqi-chip">${escapeHtml(runState)}</span>`);
+
+  if (pageStatus.provider) {
+    chips.push(`<span class="cgqi-chip">${escapeHtml(pageStatus.provider)}</span>`);
+  }
 
   if (pageStatus.connected) {
     chips.push(`<span class="cgqi-chip is-good">connected</span>`);
@@ -1196,6 +1697,7 @@ function buildOverlayChips(runState, pageStatus, activeIndex) {
 function buildOverlayControls(runState, queue, hasActiveItem) {
   const hasQueued = queue.some((item) => item.status === "queued");
   const hasRunnable = hasQueued || hasActiveItem;
+  const hasAny = queue.length > 0;
 
   return [
     overlayButton("start", "Start", !hasQueued || runState === "running", true),
@@ -1203,13 +1705,15 @@ function buildOverlayControls(runState, queue, hasActiveItem) {
     overlayButton("resume", "Resume", (runState !== "paused" && runState !== "stopped") || !hasRunnable),
     overlayButton("stop", "Stop", runState !== "running" && runState !== "paused", false, true),
     overlayButton("retry-current", "Retry Current", !hasActiveItem),
-    overlayButton("skip-current", "Skip Current", !hasActiveItem)
+    overlayButton("skip-current", "Skip Current", !hasActiveItem),
+    overlayButton("rerun-all", "Run All Again", !hasAny),
+    overlayButton("clear-all", "Delete Everything", !hasAny, false, true)
   ].join("");
 }
 
 function buildOverlayQueue(queue, currentItemId) {
   if (!queue.length) {
-    return `<div class="cgqi-empty">Add prompts here or from the popup, then start the queue.</div>`;
+    return `<div class="cgqi-empty">Add prompts here, then start the queue.</div>`;
   }
 
   return queue.map((item, index) => {
@@ -1292,6 +1796,36 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll("\"", "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+async function sendExtensionMessage(message, options = {}) {
+  if (!extensionContextAlive) {
+    return null;
+  }
+
+  try {
+    return await chrome.runtime.sendMessage(message);
+  } catch (error) {
+    if (isInvalidatedExtensionError(error)) {
+      handleInvalidatedExtensionContext(error);
+      return null;
+    }
+
+    if (!options.quiet) {
+      throw error;
+    }
+
+    return null;
+  }
+}
+
+function isInvalidatedExtensionError(error) {
+  return INVALIDATED_EXTENSION_PATTERN.test(String(error?.message || error || ""));
+}
+
+function handleInvalidatedExtensionContext(error) {
+  extensionContextAlive = false;
+  renderOverlayInvalidatedState(error?.message || "Extension reloaded. Refresh this tab.");
 }
 
 function sleep(ms) {
