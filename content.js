@@ -95,10 +95,14 @@ const OVERLAY_STORAGE_KEYS = [
   "runState",
   "currentItemId",
   "lastStatus",
-  "pageStatus"
+  "pageStatus",
+  "settings"
 ];
 
 const INVALIDATED_EXTENSION_PATTERN = /Extension context invalidated/i;
+const MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024;
+const MAX_ATTACHMENT_BATCH_BYTES = 45 * 1024 * 1024;
+const OVERLAY_POSITION_STORAGE_KEY = "overlayPosition";
 
 let monitorState = null;
 let lastKnownUrl = location.href;
@@ -107,6 +111,11 @@ let overlayDisplayState = {
   collapsed: false
 };
 let extensionContextAlive = true;
+let overlayAddAttachments = [];
+let overlayEditState = null;
+let overlayLastRenderedState = null;
+let overlayPosition = null;
+let overlayDragState = null;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "PAGE/PING") {
@@ -233,14 +242,15 @@ function buildPageStatus() {
 async function submitPrompt(payload) {
   const itemId = payload?.itemId;
   const text = String(payload?.text || "");
+  const attachments = normalizeSerializedAttachments(payload?.attachments || []);
   const settings = buildSettings(payload?.settings);
   const provider = getCurrentProvider();
 
-  if (!itemId || !text.trim()) {
+  if (!itemId || (!text.trim() && !attachments.length)) {
     return {
       ok: false,
       accepted: false,
-      error: "Prompt submission is missing an item ID or text."
+      error: "Prompt submission is missing an item ID, text, or attachments."
     };
   }
 
@@ -261,8 +271,9 @@ async function submitPrompt(payload) {
     };
   }
 
+  const desiredText = text.trim();
   const existingText = readComposerText(composer).trim();
-  if (existingText && existingText !== text.trim()) {
+  if (existingText && existingText !== desiredText) {
     return {
       ok: false,
       accepted: false,
@@ -270,16 +281,29 @@ async function submitPrompt(payload) {
     };
   }
 
-  const inserted = writeComposerText(composer, text);
-  if (!inserted) {
-    return {
-      ok: false,
-      accepted: false,
-      error: "Failed to insert text into the composer."
-    };
+  if (desiredText && existingText !== desiredText) {
+    const inserted = writeComposerText(composer, desiredText);
+    if (!inserted) {
+      return {
+        ok: false,
+        accepted: false,
+        error: "Failed to insert text into the composer."
+      };
+    }
   }
 
-  await sleep(180);
+  if (attachments.length) {
+    const uploadResult = await uploadAttachments(composer, attachments, settings.lookupTimeoutMs);
+    if (!uploadResult.ok) {
+      return {
+        ok: false,
+        accepted: false,
+        error: uploadResult.error
+      };
+    }
+  }
+
+  await sleep(attachments.length ? 700 : 180);
 
   const preSubmitSnapshot = getAssistantSnapshot();
   const started = await triggerPromptSubmission(composer, preSubmitSnapshot, settings.submitConfirmTimeoutMs);
@@ -374,10 +398,14 @@ async function tickMonitor() {
 
   if (pageIdle) {
     const itemId = monitorState.itemId;
+    const output = captureLatestOutput();
     abortCurrentRun();
     await sendExtensionMessage({
       type: "CONTENT/DONE",
-      payload: { itemId }
+      payload: {
+        itemId,
+        output
+      }
     });
     return;
   }
@@ -637,18 +665,202 @@ function isGenerating() {
 }
 
 function getAssistantSnapshot() {
-  const candidates = getResponseSelectors()
-    .flatMap((selector) => queryAllDeep(selector))
-    .filter((element, index, array) => array.indexOf(element) === index)
-    .filter((element) => isVisible(element));
-
-  if (!candidates.length) {
+  const lastCandidate = getLatestAssistantResponseElement();
+  if (!lastCandidate) {
     return "";
   }
 
-  const lastCandidate = candidates[candidates.length - 1];
   const text = lastCandidate.innerText || lastCandidate.textContent || "";
   return text.trim().slice(-4000);
+}
+
+function getAssistantResponseElements() {
+  return getResponseSelectors()
+    .flatMap((selector) => queryAllDeep(selector))
+    .filter((element, index, array) => array.indexOf(element) === index)
+    .filter((element) => isVisible(element));
+}
+
+function getLatestAssistantResponseElement() {
+  const candidates = getAssistantResponseElements();
+  return candidates.length ? candidates[candidates.length - 1] : null;
+}
+
+function captureLatestOutput() {
+  const provider = getCurrentProvider();
+  const responseElement = getLatestAssistantResponseElement();
+
+  if (!responseElement) {
+    return {
+      provider,
+      text: "",
+      assets: []
+    };
+  }
+
+  const text = (responseElement.innerText || responseElement.textContent || "").trim().slice(0, 200000);
+  const assets = collectOutputAssets(responseElement);
+
+  return {
+    provider,
+    text,
+    assets
+  };
+}
+
+function collectOutputAssets(responseElement) {
+  const assets = [];
+  const seen = new Set();
+
+  for (const anchor of Array.from(responseElement.querySelectorAll("a[href]"))) {
+    const href = normalizeOutputUrl(anchor.href);
+    if (!href || seen.has(href) || !isSavableAnchor(anchor, href)) {
+      continue;
+    }
+
+    seen.add(href);
+    assets.push({
+      kind: "file",
+      url: href,
+      filename: inferOutputFilename(anchor, href, assets.length)
+    });
+  }
+
+  for (const image of Array.from(responseElement.querySelectorAll("img"))) {
+    const source = normalizeOutputUrl(image.currentSrc || image.src);
+    if (!source || seen.has(source) || !isSavableImage(image)) {
+      continue;
+    }
+
+    seen.add(source);
+    assets.push({
+      kind: "image",
+      url: source,
+      filename: inferOutputFilename(image, source, assets.length)
+    });
+  }
+
+  return assets;
+}
+
+function isSavableAnchor(anchor, href) {
+  const descriptor = getElementDescriptor(anchor);
+
+  if (anchor.hasAttribute("download")) {
+    return true;
+  }
+
+  if (/\.(png|jpe?g|webp|gif|pdf|txt|csv|zip|docx?|xlsx?|pptx?|json|svg)(?:$|[?#])/i.test(href)) {
+    return true;
+  }
+
+  return /download|export|attachment|file|image/.test(descriptor);
+}
+
+function isSavableImage(image) {
+  const width = image.naturalWidth || image.width || 0;
+  const height = image.naturalHeight || image.height || 0;
+  const descriptor = getElementDescriptor(image);
+
+  if (/avatar|icon|profile|logo/.test(descriptor)) {
+    return false;
+  }
+
+  return width >= 96 || height >= 96 || Boolean(image.closest("a[href]"));
+}
+
+function inferOutputFilename(element, url, index) {
+  const rawName = [
+    element.getAttribute("download"),
+    element.getAttribute("aria-label"),
+    element.getAttribute("title"),
+    element.getAttribute("alt"),
+    extractFilenameFromPath(url)
+  ]
+    .filter(Boolean)
+    .find(Boolean);
+
+  const clean = sanitizeInlineFilename(rawName || `${getCurrentProvider().toLowerCase()}-asset-${index + 1}`);
+  if (/\.[a-z0-9]{2,8}$/i.test(clean)) {
+    return clean;
+  }
+
+  const extension = inferUrlExtension(url);
+  return `${clean}${extension ? `.${extension}` : ""}`;
+}
+
+function normalizeOutputUrl(url) {
+  if (typeof url !== "string") {
+    return "";
+  }
+
+  const trimmed = url.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  if (trimmed.startsWith("blob:") || trimmed.startsWith("data:")) {
+    return trimmed;
+  }
+
+  try {
+    return new URL(trimmed, location.href).toString();
+  } catch (error) {
+    return "";
+  }
+}
+
+function extractFilenameFromPath(url) {
+  if (!url || url.startsWith("data:") || url.startsWith("blob:")) {
+    return "";
+  }
+
+  try {
+    const parsed = new URL(url, location.href);
+    const lastPart = parsed.pathname.split("/").filter(Boolean).pop() || "";
+    return decodeURIComponent(lastPart);
+  } catch (error) {
+    return "";
+  }
+}
+
+function sanitizeInlineFilename(value) {
+  return String(value || "")
+    .replace(/[\\/:*?"<>|]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\.+$/, "")
+    .slice(0, 96) || "file";
+}
+
+function inferUrlExtension(url) {
+  const source = String(url || "").toLowerCase();
+
+  if (/\.png\b|data:image\/png/.test(source)) {
+    return "png";
+  }
+
+  if (/\.jpe?g\b|data:image\/jpeg/.test(source)) {
+    return "jpg";
+  }
+
+  if (/\.webp\b|data:image\/webp/.test(source)) {
+    return "webp";
+  }
+
+  if (/\.gif\b|data:image\/gif/.test(source)) {
+    return "gif";
+  }
+
+  if (/\.pdf\b|data:application\/pdf/.test(source)) {
+    return "pdf";
+  }
+
+  if (/\.txt\b|data:text\/plain/.test(source)) {
+    return "txt";
+  }
+
+  return "";
 }
 
 function getCurrentProvider(url = location.href) {
@@ -766,6 +978,198 @@ async function waitForComposer(timeoutMs) {
   }
 
   return null;
+}
+
+async function uploadAttachments(composer, attachments, timeoutMs) {
+  const provider = getCurrentProvider();
+
+  for (const attachment of attachments) {
+    const input = await waitForAttachmentInput(composer, Math.min(timeoutMs, 6000));
+    if (!input) {
+      return {
+        ok: false,
+        error: `Could not find a file upload control on ${provider}.`
+      };
+    }
+
+    const file = deserializeAttachment(attachment);
+    if (!file) {
+      return {
+        ok: false,
+        error: `Could not prepare ${attachment.name || "attachment"} for upload.`
+      };
+    }
+
+    const assigned = assignFilesToInput(input, [file]);
+    if (!assigned) {
+      return {
+        ok: false,
+        error: `Could not assign ${attachment.name} to the upload control.`
+      };
+    }
+
+    await sleep(900);
+  }
+
+  return {
+    ok: true
+  };
+}
+
+async function waitForAttachmentInput(composer, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let triggerClicked = false;
+
+  while (Date.now() < deadline) {
+    const input = findAttachmentInput(composer);
+    if (input) {
+      return input;
+    }
+
+    if (!triggerClicked) {
+      const trigger = findAttachmentTrigger(composer);
+      if (trigger) {
+        clickElement(trigger);
+        triggerClicked = true;
+      }
+    }
+
+    await sleep(250);
+  }
+
+  return null;
+}
+
+function findAttachmentInput(composer = null) {
+  const roots = [];
+  const form = composer?.closest?.("form");
+  if (form) {
+    roots.push(form);
+  }
+  if (composer?.parentElement) {
+    roots.push(composer.parentElement);
+  }
+  const nearbyContainer = composer?.closest?.("form, footer, main, rich-textarea");
+  if (nearbyContainer) {
+    roots.push(nearbyContainer);
+  }
+  roots.push(document);
+
+  for (const root of roots) {
+    const input = queryAllDeep("input[type='file']", root).find((entry) => {
+      return entry instanceof HTMLInputElement && !isDisabledElement(entry);
+    });
+
+    if (input) {
+      return input;
+    }
+  }
+
+  return null;
+}
+
+function findAttachmentTrigger(composer = null) {
+  const roots = [];
+  const form = composer?.closest?.("form");
+  if (form) {
+    roots.push(form);
+  }
+  if (composer?.parentElement) {
+    roots.push(composer.parentElement);
+  }
+  const nearbyContainer = composer?.closest?.("form, footer, main, rich-textarea");
+  if (nearbyContainer) {
+    roots.push(nearbyContainer);
+  }
+  roots.push(document);
+
+  for (const root of roots) {
+    const trigger = queryAllDeep("button, [role='button'], label", root)
+      .filter((entry) => entry instanceof HTMLElement)
+      .filter((entry) => isVisible(entry) && !isDisabledElement(entry))
+      .map((entry) => ({
+        entry,
+        score: scoreAttachmentTrigger(entry)
+      }))
+      .filter((entry) => entry.score > 0)
+      .sort((left, right) => right.score - left.score)[0]?.entry;
+
+    if (trigger) {
+      return trigger;
+    }
+  }
+
+  return null;
+}
+
+function scoreAttachmentTrigger(element) {
+  const label = getElementDescriptor(element);
+
+  if (/send|submit|stop|voice|microphone|record|search|reason|canvas|deep research|read aloud/.test(label)) {
+    return -1;
+  }
+
+  let score = 0;
+
+  if (/attach|upload|file|image|photo|picture/.test(label)) {
+    score += 120;
+  }
+
+  if (/add/.test(label) && /file|image|photo/.test(label)) {
+    score += 60;
+  }
+
+  if (element.tagName === "LABEL") {
+    score += 10;
+  }
+
+  if (element.querySelector("input[type='file']")) {
+    score += 200;
+  }
+
+  return score;
+}
+
+function assignFilesToInput(input, files) {
+  try {
+    const dataTransfer = new DataTransfer();
+    for (const file of files) {
+      dataTransfer.items.add(file);
+    }
+
+    input.files = dataTransfer.files;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+
+    return input.files?.length > 0;
+  } catch (error) {
+    console.warn("[content] assign files failed", error);
+    return false;
+  }
+}
+
+function deserializeAttachment(attachment) {
+  if (!attachment?.dataUrl || !attachment?.name) {
+    return null;
+  }
+
+  const match = /^data:([^;,]+)?(?:;base64)?,(.*)$/i.exec(attachment.dataUrl);
+  if (!match) {
+    return null;
+  }
+
+  const mimeType = attachment.type || match[1] || "application/octet-stream";
+  const binary = atob(match[2]);
+  const bytes = new Uint8Array(binary.length);
+
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+
+  return new File([bytes], attachment.name, {
+    type: mimeType,
+    lastModified: attachment.lastModified || Date.now()
+  });
 }
 
 async function waitForGenerationStart(timeoutMs, preSubmitSnapshot) {
@@ -1075,6 +1479,10 @@ async function initInPageOverlay() {
         color: #ececec;
       }
 
+      .cgqi-root.is-dragging {
+        user-select: none;
+      }
+
       .cgqi-panel {
         width: 286px;
         max-height: calc(100vh - 96px);
@@ -1119,6 +1527,13 @@ async function initInPageOverlay() {
         align-items: flex-start;
         justify-content: space-between;
         gap: 10px;
+        cursor: grab;
+        user-select: none;
+        touch-action: none;
+      }
+
+      .cgqi-root.is-dragging .cgqi-header {
+        cursor: grabbing;
       }
 
       .cgqi-eyebrow {
@@ -1349,6 +1764,77 @@ async function initInPageOverlay() {
         text-transform: uppercase;
       }
 
+      .cgqi-file-input {
+        width: 100%;
+        color: #cfd2da;
+        font: inherit;
+        font-size: 10px;
+      }
+
+      .cgqi-attachment-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .cgqi-attachment-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        min-height: 22px;
+        padding: 0 8px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.06);
+        color: #d7d9df;
+        font-size: 10px;
+        line-height: 1.2;
+      }
+
+      .cgqi-attachment-chip button {
+        border: 0;
+        padding: 0;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        cursor: pointer;
+      }
+
+      .cgqi-editor {
+        display: grid;
+        gap: 8px;
+        margin-top: 8px;
+      }
+
+      .cgqi-editor-text {
+        min-height: 74px;
+        resize: vertical;
+        padding: 8px 10px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.04);
+        color: #f5f5f6;
+        font: inherit;
+        font-size: 11px;
+        line-height: 1.4;
+      }
+
+      .cgqi-editor-text:focus {
+        outline: 1px solid rgba(138, 180, 255, 0.55);
+      }
+
+      .cgqi-editor-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .cgqi-file-note,
+      .cgqi-item-placeholder {
+        color: #8f93a0;
+        font-size: 10px;
+        line-height: 1.35;
+      }
+
       .cgqi-input {
         min-height: 64px;
         resize: vertical;
@@ -1396,8 +1882,17 @@ async function initInPageOverlay() {
             id="cgqi-quick-add"
             class="cgqi-input"
             data-role="quick-add-input"
-            placeholder="Separate prompts with blank lines. Press Ctrl+Enter to add."
+            placeholder="Press Enter to add. Use Shift+Enter for a new line."
           ></textarea>
+          <input
+            id="cgqi-quick-files"
+            class="cgqi-file-input"
+            data-role="quick-add-files"
+            type="file"
+            multiple
+          />
+          <div class="cgqi-attachment-list" data-role="quick-add-attachments"></div>
+          <div class="cgqi-file-note">Files selected here are attached to each newly added prompt in this batch.</div>
           <div class="cgqi-footer-actions">
             <button class="cgqi-button is-primary" type="button" data-overlay-action="add-prompts">Add prompts</button>
             <button class="cgqi-button" type="button" data-overlay-action="refresh-page">Refresh page</button>
@@ -1410,6 +1905,8 @@ async function initInPageOverlay() {
   overlayUi = {
     host,
     shadow,
+    root: shadow.querySelector(".cgqi-root"),
+    header: shadow.querySelector(".cgqi-header"),
     launcher: shadow.querySelector(".cgqi-launcher"),
     panel: shadow.querySelector(".cgqi-panel"),
     summary: shadow.querySelector("[data-role='summary']"),
@@ -1418,17 +1915,28 @@ async function initInPageOverlay() {
     status: shadow.querySelector("[data-role='status']"),
     controls: shadow.querySelector("[data-role='controls']"),
     queueList: shadow.querySelector("[data-role='queue-list']"),
-    quickAddInput: shadow.querySelector("[data-role='quick-add-input']")
+    quickAddInput: shadow.querySelector("[data-role='quick-add-input']"),
+    quickAddFiles: shadow.querySelector("[data-role='quick-add-files']"),
+    quickAddAttachments: shadow.querySelector("[data-role='quick-add-attachments']")
   };
 
   shadow.addEventListener("click", handleOverlayClick);
   shadow.addEventListener("keydown", handleOverlayKeydown);
+  shadow.addEventListener("input", handleOverlayInput);
+  shadow.addEventListener("change", handleOverlayChange);
+  shadow.addEventListener("paste", handleOverlayPaste);
+  overlayUi.header.addEventListener("pointerdown", handleOverlayPointerDown);
+  window.addEventListener("pointermove", handleOverlayPointerMove, true);
+  window.addEventListener("pointerup", handleOverlayPointerUp, true);
+  window.addEventListener("pointercancel", handleOverlayPointerUp, true);
+  window.addEventListener("resize", handleOverlayResize);
   try {
     chrome.storage.onChanged.addListener(handleOverlayStorageChange);
   } catch (error) {
     handleInvalidatedExtensionContext(error);
   }
 
+  await loadOverlayPosition();
   syncOverlayVisibility();
   await renderOverlayFromStorage();
   await requestOverlayCommand("POPUP/REFRESH_PAGE_STATUS");
@@ -1458,6 +1966,7 @@ async function handleOverlayClick(event) {
 
   const action = button.dataset.overlayAction;
   const itemId = button.dataset.itemId;
+  const attachmentId = button.dataset.attachmentId;
 
   if (action === "refresh-page" && !extensionContextAlive) {
     location.reload();
@@ -1501,8 +2010,84 @@ async function handleOverlayClick(event) {
     return;
   }
 
+  if (action === "edit") {
+    const item = overlayLastRenderedState?.queue?.find((entry) => entry.id === itemId);
+    if (!item) {
+      return;
+    }
+
+    overlayEditState = {
+      itemId,
+      text: item.text || "",
+      attachments: cloneAttachments(item.attachments || [])
+    };
+    await renderOverlayFromStorage();
+    return;
+  }
+
+  if (action === "edit-cancel") {
+    overlayEditState = null;
+    await renderOverlayFromStorage();
+    return;
+  }
+
+  if (action === "edit-save") {
+    if (!overlayEditState || overlayEditState.itemId !== itemId) {
+      return;
+    }
+
+    const response = await requestOverlayCommand("POPUP/UPDATE_ITEM", {
+      itemId,
+      text: overlayEditState.text,
+      attachments: overlayEditState.attachments
+    });
+
+    if (response?.ok) {
+      overlayEditState = null;
+    }
+
+    await renderOverlayFromStorage();
+    return;
+  }
+
+  if (action === "edit-remove-attachment") {
+    if (!overlayEditState || overlayEditState.itemId !== itemId) {
+      return;
+    }
+
+    overlayEditState.attachments = overlayEditState.attachments.filter((entry) => entry.id !== attachmentId);
+    await renderOverlayFromStorage();
+    return;
+  }
+
   if (action === "remove") {
     await requestOverlayCommand("POPUP/REMOVE_ITEM", { itemId });
+    return;
+  }
+
+  if (action === "toggle-auto-save") {
+    const autoSaveOutputs = !Boolean(overlayLastRenderedState?.settings?.autoSaveOutputs);
+    await requestOverlayCommand("POPUP/SAVE_SETTINGS", {
+      settings: {
+        autoSaveOutputs
+      }
+    });
+    await renderOverlayFromStorage();
+    return;
+  }
+
+  if (action === "remove-quick-attachment") {
+    overlayAddAttachments = overlayAddAttachments.filter((entry) => entry.id !== attachmentId);
+    renderQuickAddAttachments();
+    return;
+  }
+
+  if (action === "clear-quick-attachments") {
+    overlayAddAttachments = [];
+    if (overlayUi?.quickAddFiles) {
+      overlayUi.quickAddFiles.value = "";
+    }
+    renderQuickAddAttachments();
     return;
   }
 
@@ -1524,12 +2109,92 @@ async function handleOverlayClick(event) {
   }
 }
 
+function handleOverlayInput(event) {
+  if (!overlayEditState) {
+    return;
+  }
+
+  const target = event.target;
+  if (!(target instanceof HTMLTextAreaElement)) {
+    return;
+  }
+
+  if (target.dataset.role === "edit-text" && target.dataset.itemId === overlayEditState.itemId) {
+    overlayEditState.text = target.value || "";
+  }
+}
+
+async function handleOverlayChange(event) {
+  const target = event.target;
+  if (!(target instanceof HTMLInputElement) || target.type !== "file") {
+    return;
+  }
+
+  const files = Array.from(target.files || []);
+  if (!files.length) {
+    return;
+  }
+
+  try {
+    const attachments = await serializeFiles(files);
+
+    if (target.dataset.role === "quick-add-files") {
+      overlayAddAttachments = mergeAttachments(overlayAddAttachments, attachments);
+      target.value = "";
+      renderQuickAddAttachments();
+      return;
+    }
+
+    if (target.dataset.role === "edit-files" && overlayEditState && target.dataset.itemId === overlayEditState.itemId) {
+      overlayEditState.attachments = mergeAttachments(overlayEditState.attachments, attachments);
+      target.value = "";
+      await renderOverlayFromStorage();
+    }
+  } catch (error) {
+    console.warn("[content] file serialization failed", error);
+    window.alert(error.message);
+    target.value = "";
+  }
+}
+
+async function handleOverlayPaste(event) {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) {
+    return;
+  }
+
+  const files = extractClipboardFiles(event.clipboardData);
+  if (!files.length) {
+    return;
+  }
+
+  event.preventDefault();
+
+  try {
+    const attachments = await serializeFiles(files);
+
+    if (target.dataset.role === "quick-add-input") {
+      overlayAddAttachments = mergeAttachments(overlayAddAttachments, attachments);
+      renderQuickAddAttachments();
+      return;
+    }
+
+    if (target.dataset.role === "edit-text" && overlayEditState && target.dataset.itemId === overlayEditState.itemId) {
+      overlayEditState.attachments = mergeAttachments(overlayEditState.attachments, attachments);
+      await renderOverlayFromStorage();
+    }
+  } catch (error) {
+    console.warn("[content] clipboard attachment failed", error);
+    window.alert(error.message);
+  }
+}
+
 async function handleOverlayKeydown(event) {
   if (!overlayUi || event.target !== overlayUi.quickAddInput) {
     return;
   }
 
-  if (event.key === "Enter" && event.ctrlKey) {
+  if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
     await handleOverlayAddPrompts();
   }
@@ -1541,13 +2206,19 @@ async function handleOverlayAddPrompts() {
   }
 
   const prompts = splitPromptBatch(overlayUi.quickAddInput.value);
-  if (!prompts.length) {
+  if (!prompts.length && !overlayAddAttachments.length) {
     return;
   }
 
-  const response = await requestOverlayCommand("POPUP/ADD_PROMPTS", { prompts });
+  const response = await requestOverlayCommand("POPUP/ADD_PROMPTS", {
+    prompts,
+    attachments: cloneAttachments(overlayAddAttachments)
+  });
   if (response?.ok) {
     overlayUi.quickAddInput.value = "";
+    overlayUi.quickAddFiles.value = "";
+    overlayAddAttachments = [];
+    renderQuickAddAttachments();
   }
 }
 
@@ -1587,7 +2258,8 @@ async function renderOverlayFromStorage() {
     runState: rawState.runState || "idle",
     currentItemId: rawState.currentItemId || null,
     lastStatus: rawState.lastStatus || "Idle",
-    pageStatus: rawState.pageStatus || {}
+    pageStatus: rawState.pageStatus || {},
+    settings: rawState.settings || {}
   });
 }
 
@@ -1599,6 +2271,11 @@ function renderOverlay(state) {
   if (!extensionContextAlive) {
     renderOverlayInvalidatedState("Extension reloaded. Refresh this tab.");
     return;
+  }
+
+  overlayLastRenderedState = state;
+  if (overlayEditState && !state.queue.some((item) => item.id === overlayEditState.itemId)) {
+    overlayEditState = null;
   }
 
   const queue = state.queue;
@@ -1617,10 +2294,11 @@ function renderOverlay(state) {
   overlayUi.progressFill.style.width = `${progress}%`;
   overlayUi.chips.innerHTML = buildOverlayChips(state.runState, state.pageStatus, activeIndex);
   overlayUi.status.textContent = activeItem
-    ? `Active #${activeIndex}: ${truncate(activeItem.text, 96)}`
+    ? `Active #${activeIndex}: ${truncate(activeItem.text || attachmentOnlyLabel(activeItem.attachments), 96)}`
     : state.lastStatus;
-  overlayUi.controls.innerHTML = buildOverlayControls(state.runState, queue, Boolean(activeItem));
+  overlayUi.controls.innerHTML = buildOverlayControls(state.runState, queue, Boolean(activeItem), state.settings || {});
   overlayUi.queueList.innerHTML = buildOverlayQueue(queue, state.currentItemId);
+  renderQuickAddAttachments();
 
   syncOverlayVisibility();
 }
@@ -1632,6 +2310,7 @@ function syncOverlayVisibility() {
 
   overlayUi.panel.classList.toggle("is-hidden", overlayDisplayState.collapsed);
   overlayUi.launcher.classList.toggle("is-hidden", !overlayDisplayState.collapsed);
+  applyOverlayPosition(overlayPosition);
 }
 
 function toggleOverlayVisibility() {
@@ -1643,6 +2322,149 @@ function showOverlay() {
   if (overlayDisplayState.collapsed) {
     overlayDisplayState.collapsed = false;
     syncOverlayVisibility();
+  }
+}
+
+function handleOverlayPointerDown(event) {
+  if (!overlayUi || overlayDisplayState.collapsed) {
+    return;
+  }
+
+  if (!event.isPrimary || event.button !== 0) {
+    return;
+  }
+
+  if (event.target instanceof Element && event.target.closest("button, input, textarea, select, label, a")) {
+    return;
+  }
+
+  const rect = overlayUi.root.getBoundingClientRect();
+  overlayDragState = {
+    pointerId: event.pointerId,
+    offsetX: event.clientX - rect.left,
+    offsetY: event.clientY - rect.top
+  };
+
+  overlayPosition = {
+    left: rect.left,
+    top: rect.top
+  };
+
+  overlayUi.root.classList.add("is-dragging");
+  applyOverlayPosition(overlayPosition);
+
+  try {
+    overlayUi.header.setPointerCapture(event.pointerId);
+  } catch (error) {
+    // Pointer capture is optional here.
+  }
+
+  event.preventDefault();
+}
+
+function handleOverlayPointerMove(event) {
+  if (!overlayUi || !overlayDragState || event.pointerId !== overlayDragState.pointerId) {
+    return;
+  }
+
+  overlayPosition = clampOverlayPosition({
+    left: event.clientX - overlayDragState.offsetX,
+    top: event.clientY - overlayDragState.offsetY
+  });
+
+  applyOverlayPosition(overlayPosition);
+}
+
+function handleOverlayPointerUp(event) {
+  if (!overlayUi || !overlayDragState || event.pointerId !== overlayDragState.pointerId) {
+    return;
+  }
+
+  try {
+    overlayUi.header.releasePointerCapture(event.pointerId);
+  } catch (error) {
+    // Pointer capture release is optional here.
+  }
+
+  overlayUi.root.classList.remove("is-dragging");
+  overlayDragState = null;
+  persistOverlayPosition();
+}
+
+function handleOverlayResize() {
+  if (!overlayUi || !overlayPosition) {
+    return;
+  }
+
+  overlayPosition = clampOverlayPosition(overlayPosition);
+  applyOverlayPosition(overlayPosition);
+  persistOverlayPosition();
+}
+
+async function loadOverlayPosition() {
+  if (!overlayUi) {
+    return;
+  }
+
+  try {
+    const rawState = await chrome.storage.local.get([OVERLAY_POSITION_STORAGE_KEY]);
+    if (!rawState?.[OVERLAY_POSITION_STORAGE_KEY]) {
+      return;
+    }
+
+    overlayPosition = clampOverlayPosition(rawState[OVERLAY_POSITION_STORAGE_KEY]);
+    applyOverlayPosition(overlayPosition);
+  } catch (error) {
+    if (isInvalidatedExtensionError(error)) {
+      handleInvalidatedExtensionContext(error);
+      return;
+    }
+
+    console.warn("[content] overlay position load failed", error);
+  }
+}
+
+function applyOverlayPosition(position) {
+  if (!overlayUi || !position) {
+    return;
+  }
+
+  const next = clampOverlayPosition(position);
+  overlayUi.root.style.left = `${next.left}px`;
+  overlayUi.root.style.top = `${next.top}px`;
+  overlayUi.root.style.right = "auto";
+  overlayPosition = next;
+}
+
+function clampOverlayPosition(position) {
+  const margin = 8;
+  const width = overlayUi?.root?.offsetWidth || overlayUi?.panel?.offsetWidth || 286;
+  const height = overlayUi?.root?.offsetHeight || overlayUi?.panel?.offsetHeight || 120;
+  const maxLeft = Math.max(margin, window.innerWidth - width - margin);
+  const maxTop = Math.max(margin, window.innerHeight - height - margin);
+
+  return {
+    left: clampNumber(position?.left, margin, maxLeft, maxLeft),
+    top: clampNumber(position?.top, margin, maxTop, 76)
+  };
+}
+
+async function persistOverlayPosition() {
+  if (!overlayUi || !overlayPosition || !extensionContextAlive) {
+    return;
+  }
+
+  try {
+    await chrome.storage.local.set({
+      [OVERLAY_POSITION_STORAGE_KEY]: overlayPosition
+    });
+  } catch (error) {
+    if (isInvalidatedExtensionError(error)) {
+      handleInvalidatedExtensionContext(error);
+      return;
+    }
+
+    console.warn("[content] overlay position save failed", error);
   }
 }
 
@@ -1661,6 +2483,7 @@ function renderOverlayInvalidatedState(message) {
   overlayUi.queueList.innerHTML = `
     <div class="cgqi-empty">This page still has the old content script. Refresh the tab to reconnect the extension.</div>
   `;
+  overlayUi.quickAddAttachments.innerHTML = "";
 }
 
 function buildOverlayChips(runState, pageStatus, activeIndex) {
@@ -1694,10 +2517,11 @@ function buildOverlayChips(runState, pageStatus, activeIndex) {
   return chips.join("");
 }
 
-function buildOverlayControls(runState, queue, hasActiveItem) {
+function buildOverlayControls(runState, queue, hasActiveItem, settings) {
   const hasQueued = queue.some((item) => item.status === "queued");
   const hasRunnable = hasQueued || hasActiveItem;
   const hasAny = queue.length > 0;
+  const autoSaveOutputs = Boolean(settings?.autoSaveOutputs);
 
   return [
     overlayButton("start", "Start", !hasQueued || runState === "running", true),
@@ -1706,6 +2530,7 @@ function buildOverlayControls(runState, queue, hasActiveItem) {
     overlayButton("stop", "Stop", runState !== "running" && runState !== "paused", false, true),
     overlayButton("retry-current", "Retry Current", !hasActiveItem),
     overlayButton("skip-current", "Skip Current", !hasActiveItem),
+    overlayButton("toggle-auto-save", autoSaveOutputs ? "Auto Save: On" : "Auto Save: Off", false, autoSaveOutputs),
     overlayButton("rerun-all", "Run All Again", !hasAny),
     overlayButton("clear-all", "Delete Everything", !hasAny, false, true)
   ].join("");
@@ -1721,9 +2546,15 @@ function buildOverlayQueue(queue, currentItemId) {
     const isFailed = ["failed", "cancelled", "skipped"].includes(item.status);
     const showRequeue = !isActive && !["queued", "sending", "waiting"].includes(item.status);
     const metaParts = [`Retries: ${item.retryCount || 0}`];
+    const attachmentCount = Array.isArray(item.attachments) ? item.attachments.length : 0;
+    const isEditing = overlayEditState?.itemId === item.id;
 
     if (item.lastError) {
       metaParts.push(truncate(item.lastError, 82));
+    }
+
+    if (attachmentCount) {
+      metaParts.push(`${attachmentCount} file${attachmentCount === 1 ? "" : "s"}`);
     }
 
     return `
@@ -1732,11 +2563,14 @@ function buildOverlayQueue(queue, currentItemId) {
           <span class="cgqi-item-index">#${index + 1}</span>
           <span class="cgqi-chip ${overlayToneClass(item.status, isActive)}">${escapeHtml(item.status)}</span>
         </div>
-        <p class="cgqi-item-text">${escapeHtml(truncate(item.text, 150))}</p>
+        <p class="cgqi-item-text">${item.text ? escapeHtml(truncate(item.text, 150)) : `<span class="cgqi-item-placeholder">${escapeHtml(attachmentOnlyLabel(item.attachments))}</span>`}</p>
         <div class="cgqi-item-meta">${escapeHtml(metaParts.join(" | "))}</div>
+        ${attachmentCount ? `<div class="cgqi-attachment-list">${buildAttachmentChips(item.attachments)}</div>` : ""}
+        ${isEditing ? buildItemEditor(item.id) : ""}
         <div class="cgqi-item-actions">
           <button class="cgqi-mini" type="button" data-overlay-action="move-up" data-item-id="${item.id}" ${isActive || index === 0 ? "disabled" : ""}>Up</button>
           <button class="cgqi-mini" type="button" data-overlay-action="move-down" data-item-id="${item.id}" ${isActive || index === queue.length - 1 ? "disabled" : ""}>Dn</button>
+          <button class="cgqi-mini" type="button" data-overlay-action="edit" data-item-id="${item.id}" ${isActive ? "disabled" : ""}>Edit</button>
           ${showRequeue ? `<button class="cgqi-mini" type="button" data-overlay-action="requeue" data-item-id="${item.id}">Re</button>` : ""}
           <button class="cgqi-mini is-danger" type="button" data-overlay-action="remove" data-item-id="${item.id}" ${isActive ? "disabled" : ""}>X</button>
         </div>
@@ -1777,12 +2611,275 @@ function overlayToneClass(status, isActive) {
   return "";
 }
 
+function buildItemEditor(itemId) {
+  if (!overlayEditState || overlayEditState.itemId !== itemId) {
+    return "";
+  }
+
+  return `
+    <div class="cgqi-editor">
+      <textarea
+        class="cgqi-editor-text"
+        data-role="edit-text"
+        data-item-id="${itemId}"
+        placeholder="Edit prompt text"
+      >${escapeHtml(overlayEditState.text || "")}</textarea>
+      <input
+        class="cgqi-file-input"
+        data-role="edit-files"
+        data-item-id="${itemId}"
+        type="file"
+        multiple
+      />
+      ${overlayEditState.attachments.length ? `<div class="cgqi-attachment-list">${buildAttachmentChips(overlayEditState.attachments, { removable: true, itemId })}</div>` : `<div class="cgqi-file-note">No files attached.</div>`}
+      <div class="cgqi-editor-actions">
+        <button class="cgqi-mini" type="button" data-overlay-action="edit-save" data-item-id="${itemId}">Save</button>
+        <button class="cgqi-mini" type="button" data-overlay-action="edit-cancel" data-item-id="${itemId}">Cancel</button>
+      </div>
+    </div>
+  `;
+}
+
+function buildAttachmentChips(attachments, options = {}) {
+  if (!Array.isArray(attachments) || !attachments.length) {
+    return "";
+  }
+
+  const removable = Boolean(options.removable);
+  const itemId = options.itemId || "";
+
+  return attachments.map((attachment) => {
+    const label = `${attachment.name}${attachment.size ? ` (${formatBytes(attachment.size)})` : ""}`;
+    return `
+      <span class="cgqi-attachment-chip">
+        <span>${escapeHtml(truncate(label, 34))}</span>
+        ${removable ? `<button type="button" data-overlay-action="edit-remove-attachment" data-item-id="${itemId}" data-attachment-id="${attachment.id}">x</button>` : ""}
+      </span>
+    `;
+  }).join("");
+}
+
+function renderQuickAddAttachments() {
+  if (!overlayUi) {
+    return;
+  }
+
+  if (!overlayAddAttachments.length) {
+    overlayUi.quickAddAttachments.innerHTML = "";
+    return;
+  }
+
+  overlayUi.quickAddAttachments.innerHTML = `
+    ${overlayAddAttachments.map((attachment) => `
+      <span class="cgqi-attachment-chip">
+        <span>${escapeHtml(truncate(`${attachment.name}${attachment.size ? ` (${formatBytes(attachment.size)})` : ""}`, 34))}</span>
+        <button type="button" data-overlay-action="remove-quick-attachment" data-attachment-id="${attachment.id}">x</button>
+      </span>
+    `).join("")}
+    <span class="cgqi-attachment-chip">
+      <button type="button" data-overlay-action="clear-quick-attachments">clear all</button>
+    </span>
+  `;
+}
+
 function splitPromptBatch(text) {
   return String(text || "")
     .trim()
     .split(/\n\s*\n/g)
     .map((entry) => entry.trim())
     .filter(Boolean);
+}
+
+function normalizeSerializedAttachments(rawAttachments) {
+  if (!Array.isArray(rawAttachments)) {
+    return [];
+  }
+
+  return rawAttachments
+    .map((attachment) => {
+      if (!attachment || typeof attachment !== "object") {
+        return null;
+      }
+
+      const name = String(attachment.name || "").trim();
+      const dataUrl = String(attachment.dataUrl || "").trim();
+
+      if (!name || !dataUrl) {
+        return null;
+      }
+
+      return {
+        id: attachment.id || crypto.randomUUID(),
+        name,
+        type: String(attachment.type || "application/octet-stream"),
+        size: Number.isFinite(Number(attachment.size)) ? Math.max(0, Number(attachment.size)) : 0,
+        dataUrl,
+        lastModified: Number.isFinite(Number(attachment.lastModified))
+          ? Number(attachment.lastModified)
+          : Date.now()
+      };
+    })
+    .filter(Boolean);
+}
+
+function cloneAttachments(attachments) {
+  return normalizeSerializedAttachments(attachments).map((attachment) => ({ ...attachment }));
+}
+
+function mergeAttachments(existing, incoming) {
+  const seen = new Set();
+  const merged = [];
+
+  for (const attachment of [...normalizeSerializedAttachments(existing), ...normalizeSerializedAttachments(incoming)]) {
+    const key = `${attachment.name}:${attachment.size}:${attachment.lastModified}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    merged.push(attachment);
+  }
+
+  return merged;
+}
+
+async function serializeFiles(files) {
+  const totalBytes = files.reduce((sum, file) => sum + (file.size || 0), 0);
+  if (totalBytes > MAX_ATTACHMENT_BATCH_BYTES) {
+    throw new Error(`Attachments exceed ${formatBytes(MAX_ATTACHMENT_BATCH_BYTES)} for one queue edit.`);
+  }
+
+  const serialized = [];
+  for (const file of files) {
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      throw new Error(`${file.name} exceeds ${formatBytes(MAX_ATTACHMENT_BYTES)}.`);
+    }
+
+    serialized.push(await serializeFile(file));
+  }
+
+  return serialized;
+}
+
+function serializeFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+
+    reader.onload = () => {
+      resolve({
+        id: crypto.randomUUID(),
+        name: file.name,
+        type: file.type || "application/octet-stream",
+        size: file.size || 0,
+        dataUrl: String(reader.result || ""),
+        lastModified: file.lastModified || Date.now()
+      });
+    };
+
+    reader.onerror = () => {
+      reject(new Error(`Could not read ${file.name}.`));
+    };
+
+    reader.readAsDataURL(file);
+  });
+}
+
+function extractClipboardFiles(clipboardData) {
+  if (!clipboardData) {
+    return [];
+  }
+
+  const files = [];
+  const items = Array.from(clipboardData.items || []);
+
+  for (const [index, item] of items.entries()) {
+    if (item.kind !== "file") {
+      continue;
+    }
+
+    const file = item.getAsFile();
+    if (!file) {
+      continue;
+    }
+
+    files.push(ensureNamedFile(file, index));
+  }
+
+  if (files.length) {
+    return files;
+  }
+
+  return Array.from(clipboardData.files || []).map((file, index) => ensureNamedFile(file, index));
+}
+
+function ensureNamedFile(file, index) {
+  if (file.name) {
+    return file;
+  }
+
+  const extension = mimeTypeToExtension(file.type);
+  const suffix = extension ? `.${extension}` : "";
+  return new File([file], `clipboard-${Date.now()}-${index + 1}${suffix}`, {
+    type: file.type || "application/octet-stream",
+    lastModified: Date.now()
+  });
+}
+
+function mimeTypeToExtension(mimeType) {
+  const normalized = String(mimeType || "").toLowerCase();
+
+  if (normalized === "image/png") {
+    return "png";
+  }
+
+  if (normalized === "image/jpeg") {
+    return "jpg";
+  }
+
+  if (normalized === "image/webp") {
+    return "webp";
+  }
+
+  if (normalized === "image/gif") {
+    return "gif";
+  }
+
+  if (normalized === "application/pdf") {
+    return "pdf";
+  }
+
+  return "";
+}
+
+function attachmentOnlyLabel(attachments) {
+  const count = Array.isArray(attachments) ? attachments.length : 0;
+  return count ? `${count} attachment${count === 1 ? "" : "s"} only` : "No prompt text";
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B";
+  }
+
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let unitIndex = 0;
+
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+
+  return `${value >= 10 || unitIndex === 0 ? Math.round(value) : value.toFixed(1)} ${units[unitIndex]}`;
+}
+
+function clampNumber(value, min, max, fallback) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+
+  return Math.min(max, Math.max(min, numeric));
 }
 
 function truncate(text, limit) {

@@ -5,6 +5,8 @@
   "description": "Queue prompts and submit them sequentially on ChatGPT and Gemini web.",
   "permissions": [
     "storage",
+    "unlimitedStorage",
+    "downloads",
     "tabs",
     "alarms"
   ],

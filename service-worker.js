@@ -18,7 +18,8 @@ const DEFAULT_SETTINGS = {
   completionTimeoutMs: 180000,
   lookupTimeoutMs: 15000,
   submitConfirmTimeoutMs: 12000,
-  maxRetries: 1
+  maxRetries: 1,
+  autoSaveOutputs: false
 };
 
 const DEFAULT_PAGE_STATUS = {
@@ -156,7 +157,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 async function handleMessage(message, sender) {
   switch (message?.type) {
     case "POPUP/ADD_PROMPTS":
-      return handleAddPrompts(message.payload?.prompts ?? []);
+      return handleAddPrompts(message.payload || {});
     case "POPUP/START":
       return handleStart();
     case "POPUP/PAUSE":
@@ -175,6 +176,8 @@ async function handleMessage(message, sender) {
       return handleMoveItem(message.payload?.itemId, message.payload?.direction);
     case "POPUP/RETRY_ITEM":
       return handleRetryItem(message.payload?.itemId);
+    case "POPUP/UPDATE_ITEM":
+      return handleUpdateItem(message.payload || {});
     case "POPUP/CLEAR_COMPLETED":
       return handleClearCompleted();
     case "POPUP/CLEAR_ALL":
@@ -201,29 +204,19 @@ async function handleMessage(message, sender) {
   }
 }
 
-async function handleAddPrompts(rawPrompts) {
-  const prompts = rawPrompts
-    .map((prompt) => String(prompt || "").trim())
-    .filter(Boolean);
+async function handleAddPrompts(payload) {
+  const sharedAttachments = normalizeAttachments(payload?.attachments || []);
+  const items = buildQueueItemsFromPayload(payload, sharedAttachments);
 
-  if (!prompts.length) {
+  if (!items.length) {
     return {
       ok: false,
-      error: "No prompts were provided."
+      error: "No prompts or attachments were provided."
     };
   }
 
   const state = await getState();
-  const newItems = prompts.map((text) => ({
-    id: crypto.randomUUID(),
-    text,
-    status: "queued",
-    createdAt: new Date().toISOString(),
-    startedAt: null,
-    finishedAt: null,
-    retryCount: 0,
-    lastError: null
-  }));
+  const newItems = items.map((item) => buildQueueItem(item));
 
   await chrome.storage.local.set({
     queue: [...state.queue, ...newItems],
@@ -235,6 +228,77 @@ async function handleAddPrompts(rawPrompts) {
   return {
     ok: true,
     added: newItems.length
+  };
+}
+
+async function handleUpdateItem(payload) {
+  const state = await getState();
+  const itemId = payload?.itemId;
+
+  if (!itemId) {
+    return {
+      ok: false,
+      error: "Missing itemId."
+    };
+  }
+
+  if (state.currentItemId === itemId) {
+    return {
+      ok: false,
+      error: "The active prompt cannot be edited."
+    };
+  }
+
+  const existing = state.queue.find((entry) => entry.id === itemId);
+  if (!existing) {
+    return {
+      ok: false,
+      error: "Prompt not found."
+    };
+  }
+
+  const text = String(payload?.text || "").trim();
+  const attachments = normalizeAttachments(payload?.attachments || []);
+
+  if (!text && !attachments.length) {
+    return {
+      ok: false,
+      error: "A queue item needs prompt text or at least one attachment."
+    };
+  }
+
+  const queue = state.queue.map((entry) => {
+    if (entry.id !== itemId) {
+      return entry;
+    }
+
+    return normalizeQueueItem({
+      ...entry,
+      text,
+      attachments,
+      status: "queued",
+      startedAt: null,
+      finishedAt: null,
+      retryCount: 0,
+      lastError: null,
+      savedOutputsAt: null
+    });
+  });
+
+  await chrome.storage.local.set({
+    queue,
+    lastStatus: "Prompt updated."
+  });
+
+  await appendLog("Prompt updated.");
+
+  const latestState = await getState();
+  if (latestState.runState === "running") {
+    await scheduleQueueTick(400);
+  }
+
+  return {
+    ok: true
   };
 }
 
@@ -421,7 +485,8 @@ async function handleRetryCurrent() {
       startedAt: null,
       finishedAt: null,
       retryCount: item.retryCount + 1,
-      lastError: "Retry requested by user."
+      lastError: "Retry requested by user.",
+      savedOutputsAt: null
     };
   });
 
@@ -583,7 +648,8 @@ async function handleRetryItem(itemId) {
       status: "queued",
       startedAt: null,
       finishedAt: null,
-      lastError: null
+      lastError: null,
+      savedOutputsAt: null
     };
   });
 
@@ -675,7 +741,8 @@ async function handleRerunAll() {
     startedAt: null,
     finishedAt: null,
     retryCount: 0,
-    lastError: null
+    lastError: null,
+    savedOutputsAt: null
   }));
 
   await chrome.storage.local.set({
@@ -840,6 +907,7 @@ async function handlePromptDone(payload, sender) {
   const itemId = payload?.itemId;
   const senderTabId = sender.tab?.id ?? null;
   const state = await getState();
+  const completedItem = state.queue.find((item) => item.id === itemId) || null;
 
   if (!itemId) {
     return {
@@ -876,6 +944,28 @@ async function handlePromptDone(payload, sender) {
   });
 
   await appendLog("Prompt completed.");
+
+  if (state.settings.autoSaveOutputs && completedItem) {
+    const saveResult = await autoSavePromptOutputs(completedItem, payload?.output);
+
+    if (saveResult.savedAt) {
+      const savedQueue = (await getState()).queue.map((item) => {
+        if (item.id !== itemId) {
+          return item;
+        }
+
+        return {
+          ...item,
+          savedOutputsAt: saveResult.savedAt
+        };
+      });
+
+      await chrome.storage.local.set({
+        queue: savedQueue,
+        lastStatus: saveResult.message || "Prompt completed and saved."
+      });
+    }
+  }
 
   if (senderTabId) {
     await refreshPageStatusForTab(senderTabId, "Prompt completed.");
@@ -1043,6 +1133,7 @@ async function processQueue(source) {
     payload: {
       itemId: nextItem.id,
       text: nextItem.text,
+      attachments: nextItem.attachments,
       settings: buildPageSettings(state.settings)
     }
   });
@@ -1078,7 +1169,8 @@ async function failOrRetryItem(itemId, reason, tabId = null) {
         ...entry,
         status: "queued",
         retryCount: entry.retryCount + 1,
-        lastError: reason
+        lastError: reason,
+        savedOutputsAt: null
       };
     }
 
@@ -1228,7 +1320,7 @@ function normalizeState(rawState) {
       ...DEFAULT_SETTINGS,
       ...(rawState.settings || {})
     },
-    queue: Array.isArray(rawState.queue) ? rawState.queue : [],
+    queue: Array.isArray(rawState.queue) ? rawState.queue.map((item) => normalizeQueueItem(item)) : [],
     activityLog: Array.isArray(rawState.activityLog) ? rawState.activityLog : [],
     pageStatus: normalizePageStatus(rawState.pageStatus || {})
   };
@@ -1292,7 +1384,8 @@ function sanitizeSettings(rawSettings) {
     completionTimeoutMs: clampInt(rawSettings.completionTimeoutMs, 5000, 600000, DEFAULT_SETTINGS.completionTimeoutMs),
     lookupTimeoutMs: clampInt(rawSettings.lookupTimeoutMs, 1000, 60000, DEFAULT_SETTINGS.lookupTimeoutMs),
     submitConfirmTimeoutMs: clampInt(rawSettings.submitConfirmTimeoutMs, 1000, 60000, DEFAULT_SETTINGS.submitConfirmTimeoutMs),
-    maxRetries: clampInt(rawSettings.maxRetries, 0, 10, DEFAULT_SETTINGS.maxRetries)
+    maxRetries: clampInt(rawSettings.maxRetries, 0, 10, DEFAULT_SETTINGS.maxRetries),
+    autoSaveOutputs: coerceBoolean(rawSettings.autoSaveOutputs, DEFAULT_SETTINGS.autoSaveOutputs)
   };
 }
 
@@ -1327,6 +1420,104 @@ function getQueuePosition(queue, itemId) {
   return index === -1 ? "?" : index + 1;
 }
 
+function buildQueueItemsFromPayload(payload, sharedAttachments) {
+  const explicitItems = Array.isArray(payload?.items) ? payload.items : [];
+  if (explicitItems.length) {
+    return explicitItems
+      .map((entry) => ({
+        text: String(entry?.text || "").trim(),
+        attachments: normalizeAttachments(entry?.attachments || sharedAttachments)
+      }))
+      .filter((entry) => entry.text || entry.attachments.length);
+  }
+
+  const prompts = Array.isArray(payload?.prompts) ? payload.prompts : [];
+  const promptItems = prompts
+    .map((prompt) => String(prompt || "").trim())
+    .filter(Boolean)
+    .map((text) => ({
+      text,
+      attachments: sharedAttachments
+    }));
+
+  if (promptItems.length) {
+    return promptItems;
+  }
+
+  if (sharedAttachments.length) {
+    return [{
+      text: "",
+      attachments: sharedAttachments
+    }];
+  }
+
+  return [];
+}
+
+function buildQueueItem(rawItem) {
+  return normalizeQueueItem({
+    id: crypto.randomUUID(),
+    text: rawItem?.text || "",
+    attachments: rawItem?.attachments || [],
+    status: "queued",
+    createdAt: new Date().toISOString(),
+    startedAt: null,
+    finishedAt: null,
+    retryCount: 0,
+    lastError: null,
+    savedOutputsAt: null
+  });
+}
+
+function normalizeQueueItem(rawItem) {
+  return {
+    id: rawItem?.id || crypto.randomUUID(),
+    text: String(rawItem?.text || "").trim(),
+    attachments: normalizeAttachments(rawItem?.attachments || []),
+    status: rawItem?.status || "queued",
+    createdAt: rawItem?.createdAt || new Date().toISOString(),
+    startedAt: rawItem?.startedAt || null,
+    finishedAt: rawItem?.finishedAt || null,
+    retryCount: Number.isFinite(Number(rawItem?.retryCount)) ? Math.max(0, Number(rawItem.retryCount)) : 0,
+    lastError: rawItem?.lastError || null,
+    savedOutputsAt: rawItem?.savedOutputsAt || null
+  };
+}
+
+function normalizeAttachments(rawAttachments) {
+  if (!Array.isArray(rawAttachments)) {
+    return [];
+  }
+
+  return rawAttachments
+    .map((attachment) => normalizeAttachment(attachment))
+    .filter(Boolean);
+}
+
+function normalizeAttachment(rawAttachment) {
+  if (!rawAttachment || typeof rawAttachment !== "object") {
+    return null;
+  }
+
+  const name = String(rawAttachment.name || "").trim();
+  const dataUrl = String(rawAttachment.dataUrl || "").trim();
+
+  if (!name || !dataUrl) {
+    return null;
+  }
+
+  return {
+    id: rawAttachment.id || crypto.randomUUID(),
+    name,
+    type: String(rawAttachment.type || "application/octet-stream"),
+    size: Number.isFinite(Number(rawAttachment.size)) ? Math.max(0, Number(rawAttachment.size)) : 0,
+    dataUrl,
+    lastModified: Number.isFinite(Number(rawAttachment.lastModified))
+      ? Number(rawAttachment.lastModified)
+      : Date.now()
+  };
+}
+
 function isSupportedAssistantUrl(url) {
   return (
     typeof url === "string" &&
@@ -1336,4 +1527,229 @@ function isSupportedAssistantUrl(url) {
       url.startsWith("https://gemini.google.com/")
     )
   );
+}
+
+async function autoSavePromptOutputs(item, rawOutput) {
+  if (item.savedOutputsAt) {
+    return {
+      savedAt: item.savedOutputsAt,
+      message: null
+    };
+  }
+
+  const output = normalizeOutputPayload(rawOutput);
+  const hasText = Boolean(output.text.trim());
+  const assets = output.assets;
+
+  if (!hasText && !assets.length) {
+    await appendLog("Prompt completed but no savable output was detected.", "warn");
+    return {
+      savedAt: null,
+      message: null
+    };
+  }
+
+  const baseName = buildOutputBaseName(item, output);
+  let downloadCount = 0;
+
+  if (hasText) {
+    await chrome.downloads.download({
+      url: buildTextDownloadUrl(buildTextSaveContents(item, output)),
+      filename: `AI Queue Iterator/${sanitizeFilename(output.provider || "Assistant")}/${baseName}.txt`,
+      saveAs: false,
+      conflictAction: "uniquify"
+    });
+    downloadCount += 1;
+  }
+
+  for (let index = 0; index < assets.length; index += 1) {
+    const asset = assets[index];
+    const url = asset.dataUrl || asset.url;
+    if (!url) {
+      continue;
+    }
+
+    try {
+      await chrome.downloads.download({
+        url,
+        filename: `AI Queue Iterator/${sanitizeFilename(output.provider || "Assistant")}/${inferAssetFilename(asset, index, baseName)}`,
+        saveAs: false,
+        conflictAction: "uniquify"
+      });
+      downloadCount += 1;
+    } catch (error) {
+      console.warn("[service-worker] asset download failed", error);
+      await appendLog(`Auto-save skipped one asset: ${error.message}`, "warn");
+    }
+  }
+
+  const savedAt = new Date().toISOString();
+  const message = downloadCount
+    ? `Saved ${downloadCount} output file${downloadCount === 1 ? "" : "s"} automatically.`
+    : null;
+
+  if (message) {
+    await appendLog(message);
+  }
+
+  return {
+    savedAt,
+    message
+  };
+}
+
+function normalizeOutputPayload(rawOutput) {
+  const provider = String(rawOutput?.provider || "Assistant");
+  const text = String(rawOutput?.text || "");
+  const assets = Array.isArray(rawOutput?.assets)
+    ? rawOutput.assets
+      .map((asset) => normalizeOutputAsset(asset))
+      .filter(Boolean)
+    : [];
+
+  return {
+    provider,
+    text,
+    assets
+  };
+}
+
+function normalizeOutputAsset(rawAsset) {
+  if (!rawAsset || typeof rawAsset !== "object") {
+    return null;
+  }
+
+  const url = String(rawAsset.url || "").trim();
+  const dataUrl = String(rawAsset.dataUrl || "").trim();
+  const filename = String(rawAsset.filename || "").trim();
+
+  if (!url && !dataUrl) {
+    return null;
+  }
+
+  return {
+    url,
+    dataUrl,
+    filename,
+    kind: String(rawAsset.kind || "file")
+  };
+}
+
+function buildOutputBaseName(item, output) {
+  const timestamp = compactTimestamp(item.finishedAt || new Date().toISOString());
+  const source = item.text || output.text || "response";
+  const snippet = sanitizeFilename(source).slice(0, 56) || "response";
+  return `${timestamp}-${snippet}`;
+}
+
+function buildTextSaveContents(item, output) {
+  return [
+    `Provider: ${output.provider || "Assistant"}`,
+    `Completed At: ${item.finishedAt || new Date().toISOString()}`,
+    "",
+    "Prompt:",
+    item.text || "(attachment-only prompt)",
+    "",
+    "Response:",
+    output.text.trim() || "(no text detected)"
+  ].join("\r\n");
+}
+
+function buildTextDownloadUrl(text) {
+  return `data:text/plain;charset=utf-8,${encodeURIComponent(text)}`;
+}
+
+function inferAssetFilename(asset, index, baseName) {
+  const source = asset.filename || extractFilenameFromUrl(asset.url || asset.dataUrl || "");
+  const clean = sanitizeFilename(source || `asset-${index + 1}`);
+  const hasExtension = /\.[a-z0-9]{2,8}$/i.test(clean);
+
+  if (hasExtension) {
+    return `${baseName}-${clean}`;
+  }
+
+  const extension = inferAssetExtension(asset);
+  return `${baseName}-${clean}${extension ? `.${extension}` : ""}`;
+}
+
+function extractFilenameFromUrl(url) {
+  if (!url) {
+    return "";
+  }
+
+  if (url.startsWith("data:")) {
+    return "";
+  }
+
+  try {
+    const parsed = new URL(url);
+    const pathname = parsed.pathname.split("/").filter(Boolean).pop() || "";
+    return decodeURIComponent(pathname);
+  } catch (error) {
+    return "";
+  }
+}
+
+function inferAssetExtension(asset) {
+  const source = `${asset.filename || ""} ${asset.url || ""} ${asset.dataUrl || ""}`.toLowerCase();
+
+  if (/\.png\b|data:image\/png/.test(source)) {
+    return "png";
+  }
+
+  if (/\.jpe?g\b|data:image\/jpeg/.test(source)) {
+    return "jpg";
+  }
+
+  if (/\.webp\b|data:image\/webp/.test(source)) {
+    return "webp";
+  }
+
+  if (/\.gif\b|data:image\/gif/.test(source)) {
+    return "gif";
+  }
+
+  if (/\.pdf\b|data:application\/pdf/.test(source)) {
+    return "pdf";
+  }
+
+  if (/\.txt\b|data:text\/plain/.test(source)) {
+    return "txt";
+  }
+
+  return "";
+}
+
+function sanitizeFilename(value) {
+  return String(value || "")
+    .replace(/[\\/:*?"<>|]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\.+$/, "")
+    .slice(0, 96) || "file";
+}
+
+function compactTimestamp(value) {
+  return String(value || new Date().toISOString())
+    .replace(/[-:]/g, "")
+    .replace(/\..*$/, "")
+    .replace("T", "-");
+}
+
+function coerceBoolean(value, fallback) {
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    if (value.toLowerCase() === "true") {
+      return true;
+    }
+
+    if (value.toLowerCase() === "false") {
+      return false;
+    }
+  }
+
+  return fallback;
 }
