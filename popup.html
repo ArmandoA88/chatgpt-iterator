@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ChatGPT Queue Iterator</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="app">
+      <section class="hero">
+        <p class="eyebrow">ChatGPT Queue Iterator</p>
+        <h1>Queue prompts for the current chat.</h1>
+        <p class="subcopy">Same-conversation mode. Open a <code>chatgpt.com</code> tab before starting.</p>
+      </section>
+
+      <section class="panel">
+        <label class="field-label" for="prompt-input">Prompt batch</label>
+        <textarea id="prompt-input" placeholder="Paste one or more prompts here."></textarea>
+
+        <div class="row">
+          <div class="field">
+            <label class="field-label" for="delimiter-mode">Split prompts by</label>
+            <select id="delimiter-mode">
+              <option value="blankLine">Blank lines</option>
+              <option value="tripleDash">---</option>
+              <option value="custom">Custom token</option>
+            </select>
+          </div>
+
+          <div class="field" id="custom-token-wrap" hidden>
+            <label class="field-label" for="custom-token">Custom token</label>
+            <input id="custom-token" type="text" placeholder="###">
+          </div>
+        </div>
+
+        <div class="actions">
+          <button id="add-prompts" class="button primary">Add To Queue</button>
+          <button id="clear-input" class="button subtle">Clear Input</button>
+        </div>
+      </section>
+
+      <section class="panel status-panel">
+        <div class="status-head">
+          <div>
+            <p class="eyebrow">State</p>
+            <h2 id="run-state">Idle</h2>
+          </div>
+          <span id="chatgpt-connection" class="badge neutral">Disconnected</span>
+        </div>
+
+        <p id="last-status" class="last-status">No activity yet.</p>
+
+        <div class="stats">
+          <div class="stat-card">
+            <span class="stat-value" id="total-count">0</span>
+            <span class="stat-label">Total</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-value" id="remaining-count">0</span>
+            <span class="stat-label">Remaining</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-value" id="completed-count">0</span>
+            <span class="stat-label">Completed</span>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button id="start-run" class="button primary">Start</button>
+          <button id="pause-run" class="button subtle">Pause</button>
+          <button id="resume-run" class="button subtle">Resume</button>
+          <button id="stop-run" class="button danger">Stop</button>
+        </div>
+
+        <div class="actions compact">
+          <button id="skip-current" class="button subtle">Skip Current</button>
+          <button id="clear-completed" class="button subtle">Clear Completed</button>
+          <button id="clear-all" class="button subtle">Clear All</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-head">
+          <h2>Queue</h2>
+          <span id="active-label" class="queue-caption">No active prompt</span>
+        </div>
+        <div id="queue-list" class="list empty">Queue is empty.</div>
+      </section>
+
+      <section class="panel">
+        <div class="section-head">
+          <h2>Activity Log</h2>
+        </div>
+        <div id="activity-log" class="list empty">No log entries yet.</div>
+      </section>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
