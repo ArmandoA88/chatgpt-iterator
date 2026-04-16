@@ -116,6 +116,7 @@ let overlayEditState = null;
 let overlayLastRenderedState = null;
 let overlayPosition = null;
 let overlayDragState = null;
+let overlayQueueDragState = null;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "PAGE/PING") {
@@ -1705,6 +1706,15 @@ async function initInPageOverlay() {
         border-color: rgba(196, 83, 83, 0.32);
       }
 
+      .cgqi-item.is-compact {
+        padding: 7px 9px;
+      }
+
+      .cgqi-item.is-drop-target {
+        border-color: rgba(138, 180, 255, 0.52);
+        box-shadow: inset 0 0 0 1px rgba(138, 180, 255, 0.22);
+      }
+
       .cgqi-item-head {
         display: flex;
         align-items: center;
@@ -1725,14 +1735,36 @@ async function initInPageOverlay() {
         line-height: 1.38;
       }
 
+      .cgqi-item-text.is-editable {
+        cursor: pointer;
+      }
+
+      .cgqi-item.is-compact .cgqi-item-text {
+        margin: 4px 0 0;
+        font-size: 11px;
+        line-height: 1.25;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
       .cgqi-item-meta {
         color: #8f93a0;
         font-size: 10px;
         line-height: 1.35;
       }
 
+      .cgqi-item.is-compact .cgqi-item-meta,
+      .cgqi-item.is-compact .cgqi-attachment-list {
+        display: none;
+      }
+
       .cgqi-item-actions {
         margin-top: 8px;
+      }
+
+      .cgqi-item.is-compact .cgqi-item-actions {
+        margin-top: 5px;
       }
 
       .cgqi-mini {
@@ -1742,6 +1774,19 @@ async function initInPageOverlay() {
         color: #d7d9df;
         font-size: 10px;
         font-weight: 700;
+      }
+
+      .cgqi-mini.is-drag {
+        cursor: grab;
+      }
+
+      .cgqi-mini.is-drag:active {
+        cursor: grabbing;
+      }
+
+      .cgqi-mini.is-disabled {
+        opacity: 0.42;
+        cursor: not-allowed;
       }
 
       .cgqi-mini.is-danger {
@@ -1925,6 +1970,10 @@ async function initInPageOverlay() {
   shadow.addEventListener("input", handleOverlayInput);
   shadow.addEventListener("change", handleOverlayChange);
   shadow.addEventListener("paste", handleOverlayPaste);
+  shadow.addEventListener("dragstart", handleQueueDragStart);
+  shadow.addEventListener("dragover", handleQueueDragOver);
+  shadow.addEventListener("drop", handleQueueDrop);
+  shadow.addEventListener("dragend", handleQueueDragEnd);
   overlayUi.header.addEventListener("pointerdown", handleOverlayPointerDown);
   window.addEventListener("pointermove", handleOverlayPointerMove, true);
   window.addEventListener("pointerup", handleOverlayPointerUp, true);
@@ -2011,6 +2060,21 @@ async function handleOverlayClick(event) {
   }
 
   if (action === "edit") {
+    const item = overlayLastRenderedState?.queue?.find((entry) => entry.id === itemId);
+    if (!item) {
+      return;
+    }
+
+    overlayEditState = {
+      itemId,
+      text: item.text || "",
+      attachments: cloneAttachments(item.attachments || [])
+    };
+    await renderOverlayFromStorage();
+    return;
+  }
+
+  if (action === "edit-text-direct") {
     const item = overlayLastRenderedState?.queue?.find((entry) => entry.id === itemId);
     if (!item) {
       return;
@@ -2187,6 +2251,118 @@ async function handleOverlayPaste(event) {
     console.warn("[content] clipboard attachment failed", error);
     window.alert(error.message);
   }
+}
+
+function handleQueueDragStart(event) {
+  const handle = event.target instanceof Element
+    ? event.target.closest("[data-queue-drag-handle='true']")
+    : null;
+
+  if (!handle) {
+    return;
+  }
+
+  const itemId = handle.getAttribute("data-item-id");
+  if (!itemId) {
+    return;
+  }
+
+  overlayQueueDragState = { itemId };
+
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", itemId);
+  }
+}
+
+function handleQueueDragOver(event) {
+  if (!overlayQueueDragState) {
+    return;
+  }
+
+  const item = event.target instanceof Element
+    ? event.target.closest("[data-queue-item='true']")
+    : null;
+
+  if (!item) {
+    clearQueueDropTarget();
+    return;
+  }
+
+  const itemId = item.getAttribute("data-item-id");
+  if (!itemId || itemId === overlayQueueDragState.itemId || item.getAttribute("data-queue-active") === "true") {
+    clearQueueDropTarget();
+    return;
+  }
+
+  event.preventDefault();
+  if (event.dataTransfer) {
+    event.dataTransfer.dropEffect = "move";
+  }
+
+  setQueueDropTarget(itemId);
+}
+
+async function handleQueueDrop(event) {
+  if (!overlayQueueDragState) {
+    return;
+  }
+
+  const item = event.target instanceof Element
+    ? event.target.closest("[data-queue-item='true']")
+    : null;
+
+  if (!item) {
+    clearQueueDropTarget();
+    overlayQueueDragState = null;
+    return;
+  }
+
+  const targetItemId = item.getAttribute("data-item-id");
+  const targetIndex = Number(item.getAttribute("data-item-index"));
+  const active = item.getAttribute("data-queue-active") === "true";
+
+  clearQueueDropTarget();
+
+  if (!targetItemId || active || targetItemId === overlayQueueDragState.itemId || !Number.isInteger(targetIndex)) {
+    overlayQueueDragState = null;
+    return;
+  }
+
+  event.preventDefault();
+  await requestOverlayCommand("POPUP/REORDER_ITEM", {
+    itemId: overlayQueueDragState.itemId,
+    targetIndex
+  });
+  overlayQueueDragState = null;
+}
+
+function setQueueDropTarget(itemId) {
+  if (!overlayUi) {
+    return;
+  }
+
+  clearQueueDropTarget();
+
+  const target = overlayUi.shadow.querySelector(`[data-queue-item='true'][data-item-id='${CSS.escape(itemId)}']`);
+  if (target) {
+    target.classList.add("is-drop-target");
+  }
+}
+
+function clearQueueDropTarget() {
+  if (!overlayUi) {
+    return;
+  }
+
+  overlayUi.shadow.querySelectorAll(".cgqi-item.is-drop-target").forEach((node) => {
+    node.classList.remove("is-drop-target");
+  });
+}
+
+function handleQueueDragEnd() {
+  overlayQueueDragState = null;
+  clearQueueDropTarget();
 }
 
 async function handleOverlayKeydown(event) {
@@ -2569,6 +2745,9 @@ function buildOverlayQueue(queue, currentItemId) {
     const metaParts = [`Retries: ${item.retryCount || 0}`];
     const attachmentCount = Array.isArray(item.attachments) ? item.attachments.length : 0;
     const isEditing = overlayEditState?.itemId === item.id;
+    const isCompact = item.status === "queued" && !isActive && !isEditing;
+    const canDrag = !isActive && !isEditing;
+    const previewText = item.text || attachmentOnlyLabel(item.attachments);
 
     if (item.lastError) {
       metaParts.push(truncate(item.lastError, 82));
@@ -2579,18 +2758,34 @@ function buildOverlayQueue(queue, currentItemId) {
     }
 
     return `
-      <article class="cgqi-item${isActive ? " is-active" : ""}${isFailed ? " is-failed" : ""}">
+      <article
+        class="cgqi-item${isActive ? " is-active" : ""}${isFailed ? " is-failed" : ""}${isCompact ? " is-compact" : ""}"
+        data-queue-item="true"
+        data-item-id="${item.id}"
+        data-item-index="${index}"
+        data-queue-active="${isActive ? "true" : "false"}"
+      >
         <div class="cgqi-item-head">
           <span class="cgqi-item-index">#${index + 1}</span>
           <span class="cgqi-chip ${overlayToneClass(item.status, isActive)}">${escapeHtml(item.status)}</span>
         </div>
-        <p class="cgqi-item-text">${item.text ? escapeHtml(truncate(item.text, 150)) : `<span class="cgqi-item-placeholder">${escapeHtml(attachmentOnlyLabel(item.attachments))}</span>`}</p>
+        <p
+          class="cgqi-item-text${!isActive ? " is-editable" : ""}"
+          ${!isActive ? `data-overlay-action="edit-text-direct" data-item-id="${item.id}" title="Edit prompt"` : ""}
+        >${item.text ? escapeHtml(truncate(previewText, isCompact ? 72 : 150)) : `<span class="cgqi-item-placeholder">${escapeHtml(attachmentOnlyLabel(item.attachments))}</span>`}</p>
         <div class="cgqi-item-meta">${escapeHtml(metaParts.join(" | "))}</div>
         ${attachmentCount ? `<div class="cgqi-attachment-list">${buildAttachmentChips(item.attachments)}</div>` : ""}
         ${isEditing ? buildItemEditor(item.id) : ""}
         <div class="cgqi-item-actions">
-          <button class="cgqi-mini" type="button" data-overlay-action="move-up" data-item-id="${item.id}" ${isActive || index === 0 ? "disabled" : ""}>Up</button>
-          <button class="cgqi-mini" type="button" data-overlay-action="move-down" data-item-id="${item.id}" ${isActive || index === queue.length - 1 ? "disabled" : ""}>Dn</button>
+          <span
+            class="cgqi-mini is-drag${!canDrag ? " is-disabled" : ""}"
+            draggable="${canDrag ? "true" : "false"}"
+            data-queue-drag-handle="true"
+            data-item-id="${item.id}"
+            title="${canDrag ? "Drag to reorder" : "Active prompt cannot be moved"}"
+          >Drag</span>
+          ${!isCompact ? `<button class="cgqi-mini" type="button" data-overlay-action="move-up" data-item-id="${item.id}" ${isActive || index === 0 ? "disabled" : ""}>Up</button>` : ""}
+          ${!isCompact ? `<button class="cgqi-mini" type="button" data-overlay-action="move-down" data-item-id="${item.id}" ${isActive || index === queue.length - 1 ? "disabled" : ""}>Dn</button>` : ""}
           <button class="cgqi-mini" type="button" data-overlay-action="edit" data-item-id="${item.id}" ${isActive ? "disabled" : ""}>Edit</button>
           ${showRequeue ? `<button class="cgqi-mini" type="button" data-overlay-action="requeue" data-item-id="${item.id}">Re</button>` : ""}
           <button class="cgqi-mini is-danger" type="button" data-overlay-action="remove" data-item-id="${item.id}" ${isActive ? "disabled" : ""}>X</button>

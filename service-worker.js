@@ -174,6 +174,8 @@ async function handleMessage(message, sender) {
       return handleRemoveItem(message.payload?.itemId);
     case "POPUP/MOVE_ITEM":
       return handleMoveItem(message.payload?.itemId, message.payload?.direction);
+    case "POPUP/REORDER_ITEM":
+      return handleReorderItem(message.payload?.itemId, message.payload?.targetIndex);
     case "POPUP/RETRY_ITEM":
       return handleRetryItem(message.payload?.itemId);
     case "POPUP/UPDATE_ITEM":
@@ -601,6 +603,69 @@ async function handleMoveItem(itemId, direction) {
   });
 
   await appendLog(`Prompt moved ${direction}.`);
+
+  return {
+    ok: true
+  };
+}
+
+async function handleReorderItem(itemId, targetIndex) {
+  const state = await getState();
+
+  if (!itemId) {
+    return {
+      ok: false,
+      error: "Missing itemId."
+    };
+  }
+
+  if (state.currentItemId === itemId) {
+    return {
+      ok: false,
+      error: "The active prompt cannot be moved."
+    };
+  }
+
+  const fromIndex = state.queue.findIndex((item) => item.id === itemId);
+  if (fromIndex === -1) {
+    return {
+      ok: false,
+      error: "Prompt not found."
+    };
+  }
+
+  const nextIndex = Number(targetIndex);
+  if (!Number.isInteger(nextIndex) || nextIndex < 0 || nextIndex >= state.queue.length) {
+    return {
+      ok: false,
+      error: "Target position is invalid."
+    };
+  }
+
+  if (fromIndex === nextIndex) {
+    return {
+      ok: true,
+      skipped: true
+    };
+  }
+
+  if (state.queue[nextIndex]?.id === state.currentItemId) {
+    return {
+      ok: false,
+      error: "The active prompt cannot be displaced."
+    };
+  }
+
+  const queue = [...state.queue];
+  const [item] = queue.splice(fromIndex, 1);
+  queue.splice(nextIndex, 0, item);
+
+  await chrome.storage.local.set({
+    queue,
+    lastStatus: "Prompt reordered."
+  });
+
+  await appendLog("Prompt reordered.");
 
   return {
     ok: true

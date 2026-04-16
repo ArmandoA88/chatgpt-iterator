@@ -22,7 +22,7 @@ Chrome extension scaffold for queueing prompts on supported AI web apps and subm
 - Same-conversation mode only.
 - Queue stored in `chrome.storage.local`.
 - Start, pause, resume, stop, retry current, skip current, delete everything, and run all again.
-- Per-item queue controls for move up, move down, edit, requeue, and remove.
+- Per-item queue controls for direct text editing, drag reordering, requeue, and remove.
 - In-page queue panel on ChatGPT web and Gemini web with quick-add and live queue status.
 - Queue items can store prompt text plus attached files/images.
 - Quick add submits with `Enter`, uses `Shift+Enter` for a newline, and item editors accept clipboard image/file paste with `Ctrl+V`.
@@ -30,6 +30,8 @@ Chrome extension scaffold for queueing prompts on supported AI web apps and subm
 - Optional `Auto Save` toggle downloads detected AI-generated files and images after each completed prompt.
 - Page diagnostics for composer, send button, draft state, and generation state.
 - Best-effort DOM selectors for ChatGPT and Gemini composer, send, stop, upload, and response controls.
+
+Queued items are rendered in a compact collapsed state by default so long queues take less vertical space. Click the prompt text or `Edit` to expand inline editing.
 
 ## Debugging
 
