@@ -1,5 +1,8 @@
 const CHATGPT_COMPOSER_SELECTORS = [
   "form textarea",
+  "form #prompt-textarea",
+  "#prompt-textarea",
+  ".ProseMirror[contenteditable='true']",
   "textarea[data-testid]",
   "textarea[placeholder]",
   "textarea",
@@ -22,6 +25,9 @@ const GENERIC_COMPOSER_SELECTORS = [
 ];
 
 const CHATGPT_SEND_BUTTON_SELECTORS = [
+  "button[data-testid='send-button']",
+  "button[aria-label='Send prompt']",
+  "button[aria-label*='Send prompt']",
   "form button[data-testid*='send']",
   "form button[aria-label*='Send']",
   "form button[aria-label*='send']",
@@ -273,22 +279,23 @@ async function submitPrompt(payload) {
   }
 
   const desiredText = text.trim();
-  const existingText = readComposerText(composer).trim();
-  if (existingText && existingText !== desiredText) {
-    return {
-      ok: false,
-      accepted: false,
-      error: "Composer is not empty. Clear manual draft text before starting."
-    };
-  }
+  const existingText = readComposerText(composer);
+  const existingMarkup = readComposerMarkup(composer);
+  const normalizedDesiredText = normalizeComposerText(desiredText);
+  const normalizedExistingText = normalizeComposerText(existingText);
 
-  if (desiredText && existingText !== desiredText) {
+  if (normalizedExistingText !== normalizedDesiredText) {
     const inserted = writeComposerText(composer, desiredText);
-    if (!inserted) {
+    await sleep(180);
+
+    if (!inserted && !composerLooksReadyForSubmit(composer, desiredText, {
+      previousText: existingText,
+      previousMarkup: existingMarkup
+    })) {
       return {
         ok: false,
         accepted: false,
-        error: "Failed to insert text into the composer."
+        error: "Failed to set the composer text."
       };
     }
   }
@@ -481,7 +488,92 @@ function readComposerText(composer) {
     return composer.value || "";
   }
 
-  return composer.innerText || composer.textContent || "";
+  if (composer instanceof HTMLElement && composer.isContentEditable) {
+    return readContentEditableText(composer);
+  }
+
+  return composer.textContent || composer.innerText || "";
+}
+
+function readComposerMarkup(composer) {
+  if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
+    return composer.value || "";
+  }
+
+  if (composer instanceof HTMLElement) {
+    return composer.innerHTML || composer.textContent || "";
+  }
+
+  return "";
+}
+
+function normalizeComposerText(text) {
+  return String(text || "")
+    .replace(/[\u200b-\u200d\u2060\ufeff]/g, "")
+    .replace(/\u00a0/g, " ")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function canonicalizeComposerMatchText(text) {
+  return normalizeComposerText(text)
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function composerTextMatches(actualText, expectedText) {
+  const actual = canonicalizeComposerMatchText(actualText);
+  const expected = canonicalizeComposerMatchText(expectedText);
+
+  if (!expected) {
+    return !actual;
+  }
+
+  if (actual === expected) {
+    return true;
+  }
+
+  if (actual.includes(expected)) {
+    return true;
+  }
+
+  return expected.includes(actual) && actual.length >= Math.max(12, Math.floor(expected.length * 0.85));
+}
+
+function composerLooksReadyForSubmit(composer, expectedText, options = {}) {
+  const actualText = readComposerText(composer);
+  if (composerTextMatches(actualText, expectedText)) {
+    return true;
+  }
+
+  const actualMarkup = readComposerMarkup(composer);
+  const previousText = String(options.previousText || "");
+  const previousMarkup = String(options.previousMarkup || "");
+  const hasTextNow = canonicalizeComposerMatchText(actualText).length > 0;
+  const markupChanged = normalizeComposerText(actualMarkup) !== normalizeComposerText(previousMarkup);
+  const textChanged = canonicalizeComposerMatchText(actualText) !== canonicalizeComposerMatchText(previousText);
+  const sendButton = findSendButton(composer);
+
+  return Boolean(
+    sendButton &&
+    hasTextNow &&
+    (markupChanged || textChanged)
+  );
+}
+
+function readContentEditableText(composer) {
+  const clone = composer.cloneNode(true);
+  if (!(clone instanceof HTMLElement)) {
+    return composer.textContent || composer.innerText || "";
+  }
+
+  clone.querySelectorAll("button, [role='button'], svg, img, canvas, [aria-hidden='true'], [contenteditable='false']").forEach((node) => {
+    node.remove();
+  });
+
+  return clone.textContent || composer.textContent || composer.innerText || "";
 }
 
 function writeComposerText(composer, text) {
@@ -498,7 +590,7 @@ function writeComposerText(composer, text) {
     descriptor.set.call(composer, text);
     dispatchSyntheticInputEvents(composer, text);
 
-    return readComposerText(composer).trim() === text.trim();
+    return composerTextMatches(readComposerText(composer), text);
   }
 
   if (composer.isContentEditable) {
@@ -511,17 +603,38 @@ function writeComposerText(composer, text) {
       inserted = false;
     }
 
-    if (!inserted) {
-      composer.replaceChildren(document.createTextNode(text));
+    if (!inserted || !composerTextMatches(readComposerText(composer), text)) {
+      applyContentEditableText(composer, text);
     }
 
     dispatchSyntheticInputEvents(composer, text);
     moveCaretToEnd(composer);
 
-    return readComposerText(composer).trim() === text.trim();
+    return composerLooksReadyForSubmit(composer, text);
   }
 
   return false;
+}
+
+function applyContentEditableText(composer, text) {
+  const lines = String(text || "").split("\n");
+  const fragment = document.createDocumentFragment();
+
+  for (const line of lines) {
+    const paragraph = document.createElement("p");
+    if (line) {
+      paragraph.textContent = line;
+    } else {
+      paragraph.append(document.createElement("br"));
+    }
+    fragment.append(paragraph);
+  }
+
+  if (!fragment.childNodes.length) {
+    fragment.append(document.createElement("p"));
+  }
+
+  composer.replaceChildren(fragment);
 }
 
 function findSendButton(composer = null) {
@@ -925,6 +1038,9 @@ function scoreComposer(element) {
     element.getAttribute("aria-label"),
     element.getAttribute("placeholder"),
     element.getAttribute("data-placeholder"),
+    element.getAttribute("data-testid"),
+    element.id,
+    element.className,
     element.textContent
   ]
     .filter(Boolean)
@@ -941,6 +1057,10 @@ function scoreComposer(element) {
     score += 20;
   }
 
+  if (element.getAttribute("role") === "textbox") {
+    score += 25;
+  }
+
   if (element.closest("form")) {
     score += 30;
   }
@@ -955,6 +1075,10 @@ function scoreComposer(element) {
 
   if (/prompt|message|ask|type|write|enter/.test(label)) {
     score += 80;
+  }
+
+  if (/prompt-textarea|prosemirror/.test(label)) {
+    score += 120;
   }
 
   const rect = element.getBoundingClientRect();
@@ -1208,6 +1332,7 @@ async function triggerPromptSubmission(composer, preSubmitSnapshot, timeoutMs) {
         return false;
       }
 
+      sendButton.focus();
       clickElement(sendButton);
       return waitForGenerationStart(remainingAttemptMs(startTime, timeoutMs), preSubmitSnapshot);
     },
@@ -1269,12 +1394,15 @@ function dispatchEnterSubmit(composer, modifiers = {}) {
   const keyboardEventInit = {
     bubbles: true,
     cancelable: true,
+    composed: true,
     key: "Enter",
     code: "Enter",
     which: 13,
     keyCode: 13,
+    charCode: 13,
     ctrlKey: Boolean(modifiers.ctrlKey),
-    metaKey: Boolean(modifiers.metaKey)
+    metaKey: Boolean(modifiers.metaKey),
+    shiftKey: Boolean(modifiers.shiftKey)
   };
 
   composer.dispatchEvent(new KeyboardEvent("keydown", keyboardEventInit));
@@ -1291,12 +1419,13 @@ function selectElementContents(element) {
 }
 
 function clickElement(element) {
-  element.dispatchEvent(new PointerEvent("pointerover", { bubbles: true }));
-  element.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
-  element.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
-  element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-  element.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
-  element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+  element.focus?.();
+  element.dispatchEvent(new PointerEvent("pointerover", { bubbles: true, composed: true }));
+  element.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, composed: true }));
+  element.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, composed: true }));
+  element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, composed: true }));
+  element.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, composed: true }));
+  element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, composed: true }));
   element.click();
 }
 
