@@ -2269,6 +2269,17 @@ async function handleOverlayClick(event) {
     return;
   }
 
+  if (action === "toggle-auto-split") {
+    const autoSplitPrompts = !Boolean(overlayLastRenderedState?.settings?.autoSplitPrompts);
+    await requestOverlayCommand("POPUP/SAVE_SETTINGS", {
+      settings: {
+        autoSplitPrompts
+      }
+    });
+    await renderOverlayFromStorage();
+    return;
+  }
+
   if (action === "remove-quick-attachment") {
     overlayAddAttachments = overlayAddAttachments.filter((entry) => entry.id !== attachmentId);
     renderQuickAddAttachments();
@@ -2511,7 +2522,10 @@ async function handleOverlayAddPrompts() {
   }
 
   const shouldAutoStart = shouldAutoStartQuickAdd();
-  const prompts = splitPromptBatch(overlayUi.quickAddInput.value);
+  const prompts = splitPromptBatch(
+    overlayUi.quickAddInput.value,
+    Boolean(overlayLastRenderedState?.settings?.autoSplitPrompts)
+  );
   if (!prompts.length && !overlayAddAttachments.length) {
     return;
   }
@@ -2624,6 +2638,9 @@ function renderOverlay(state) {
     : state.lastStatus;
   overlayUi.controls.innerHTML = buildOverlayControls(state.runState, queue, Boolean(activeItem), state.settings || {});
   overlayUi.queueList.innerHTML = buildOverlayQueue(queue, state.currentItemId);
+  overlayUi.quickAddInput.placeholder = Boolean(state.settings?.autoSplitPrompts)
+    ? "Press Enter to add. Use --- anywhere to split. Shift+Enter for a new line."
+    : "Press Enter to add. Use Shift+Enter for a new line.";
   renderQuickAddAttachments();
 
   syncOverlayVisibility();
@@ -2848,6 +2865,7 @@ function buildOverlayControls(runState, queue, hasActiveItem, settings) {
   const hasRunnable = hasQueued || hasActiveItem;
   const hasAny = queue.length > 0;
   const autoSaveOutputs = Boolean(settings?.autoSaveOutputs);
+  const autoSplitPrompts = Boolean(settings?.autoSplitPrompts);
 
   return [
     overlayButton("start", "Start", !hasQueued || runState === "running", true),
@@ -2856,6 +2874,7 @@ function buildOverlayControls(runState, queue, hasActiveItem, settings) {
     overlayButton("stop", "Stop", runState !== "running" && runState !== "paused", false, true),
     overlayButton("retry-current", "Retry Current", !hasActiveItem),
     overlayButton("skip-current", "Skip Current", !hasActiveItem),
+    overlayButton("toggle-auto-split", autoSplitPrompts ? "Auto Split: On" : "Auto Split: Off", false, autoSplitPrompts),
     overlayButton("toggle-auto-save", autoSaveOutputs ? "Auto Save: On" : "Auto Save: Off", false, autoSaveOutputs),
     overlayButton("rerun-all", "Run All Again", !hasAny),
     overlayButton("clear-all", "Delete Everything", !hasAny, false, true)
@@ -3027,12 +3046,22 @@ function renderQuickAddAttachments() {
   `;
 }
 
-function splitPromptBatch(text) {
-  return String(text || "")
-    .trim()
-    .split(/\n\s*\n/g)
+function splitPromptBatch(text, autoSplitPrompts = false) {
+  const normalized = String(text || "").trim();
+  if (!normalized) {
+    return [];
+  }
+
+  const separator = autoSplitPrompts ? /-{3,}/g : /\n\s*\n/g;
+
+  return normalized
+    .split(separator)
     .map((entry) => entry.trim())
-    .filter(Boolean);
+    .filter((entry) => hasPromptContent(entry));
+}
+
+function hasPromptContent(text) {
+  return /[^\s-]/.test(String(text || ""));
 }
 
 function normalizeSerializedAttachments(rawAttachments) {

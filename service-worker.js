@@ -19,7 +19,8 @@ const DEFAULT_SETTINGS = {
   lookupTimeoutMs: 15000,
   submitConfirmTimeoutMs: 12000,
   maxRetries: 1,
-  autoSaveOutputs: false
+  autoSaveOutputs: false,
+  autoSplitPrompts: false
 };
 
 const DEFAULT_PAGE_STATUS = {
@@ -1451,7 +1452,8 @@ function sanitizeSettings(rawSettings) {
     lookupTimeoutMs: clampInt(rawSettings.lookupTimeoutMs, 1000, 60000, DEFAULT_SETTINGS.lookupTimeoutMs),
     submitConfirmTimeoutMs: clampInt(rawSettings.submitConfirmTimeoutMs, 1000, 60000, DEFAULT_SETTINGS.submitConfirmTimeoutMs),
     maxRetries: clampInt(rawSettings.maxRetries, 0, 10, DEFAULT_SETTINGS.maxRetries),
-    autoSaveOutputs: coerceBoolean(rawSettings.autoSaveOutputs, DEFAULT_SETTINGS.autoSaveOutputs)
+    autoSaveOutputs: coerceBoolean(rawSettings.autoSaveOutputs, DEFAULT_SETTINGS.autoSaveOutputs),
+    autoSplitPrompts: coerceBoolean(rawSettings.autoSplitPrompts, DEFAULT_SETTINGS.autoSplitPrompts)
   };
 }
 
