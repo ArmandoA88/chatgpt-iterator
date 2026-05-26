@@ -114,7 +114,7 @@ let monitorState = null;
 let lastKnownUrl = location.href;
 let overlayUi = null;
 let overlayDisplayState = {
-  collapsed: false
+  collapsed: true
 };
 let extensionContextAlive = true;
 let overlayAddAttachments = [];
@@ -2034,8 +2034,8 @@ async function initInPageOverlay() {
       }
     </style>
     <div class="cgqi-root">
-      <button class="cgqi-launcher is-hidden" type="button" data-overlay-action="toggle">Queue</button>
-      <aside class="cgqi-panel">
+      <button class="cgqi-launcher" type="button" data-overlay-action="toggle">Queue</button>
+      <aside class="cgqi-panel is-hidden">
         <div class="cgqi-header">
           <div>
             <p class="cgqi-eyebrow">Queue</p>
